@@ -1,96 +1,75 @@
-import glob
-import os
-import shutil
-import subprocess
-import winreg
-from typing import Optional
+import heapq
+import math
+from typing import List, Tuple, Optional
 
 
-class MuMuPathFinder:
-    """Automated locator engine for MuMuPlayer installations and ADB binaries."""
+class AStarPathfinder:
+    """Implements A* pathfinding algorithm over a 2D grid for game navigation."""
 
-    @classmethod
-    def auto_detect_adb(cls) -> str:
-        """Executes a 4-tier resolution pipeline to find adb.exe automatically."""
-        adb_path = cls._find_from_running_processes()
-        if adb_path:
-            return adb_path
+    def __init__(self, grid_w: int = 100, grid_h: int = 100) -> None:
+        self.grid_w = grid_w
+        self.grid_h = grid_h
+        # 0 = walkable, 1 = obstacle
+        self.grid = [[0 for _ in range(grid_h)] for _ in range(grid_w)]
 
-        if shutil.which("adb"):
-            return "adb"
+    def set_obstacle(self, x: int, y: int, is_obstacle: bool = True) -> None:
+        if 0 <= x < self.grid_w and 0 <= y < self.grid_h:
+            self.grid[x][y] = 1 if is_obstacle else 0
 
-        adb_path = cls._find_from_registry()
-        if adb_path:
-            return adb_path
+    def _heuristic(self, a: Tuple[int, int], b: Tuple[int, int]) -> float:
+        """Euclidean distance heuristic for smooth directional pathing."""
+        return math.hypot(a[0] - b[0], a[1] - b[1])
 
-        adb_path = cls._find_from_drive_scan()
-        if adb_path:
-            return adb_path
+    def find_path(
+        self, start: Tuple[int, int], goal: Tuple[int, int]
+    ) -> Optional[List[Tuple[int, int]]]:
+        """Calculates optimal path from start to goal coordinates using A* search."""
+        if not (0 <= start[0] < self.grid_w and 0 <= start[1] < self.grid_h):
+            return None
+        if not (0 <= goal[0] < self.grid_w and 0 <= goal[1] < self.grid_h):
+            return None
 
-        raise FileNotFoundError(
-            "Automatic detection could not locate 'adb.exe'. Ensure MuMuPlayer is installed."
-        )
+        open_set: List[Tuple[float, Tuple[int, int]]] = []
+        heapq.heappush(open_set, (0.0, start))
 
-    @classmethod
-    def _find_from_running_processes(cls) -> Optional[str]:
-        try:
-            cmd = [
-                "wmic",
-                "process",
-                "where",
-                "name='MuMuPlayer.exe' or name='NemuPlayer.exe'",
-                "get",
-                "ExecutablePath",
-            ]
-            output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
-            for line in output.splitlines():
-                line = line.strip()
-                if line and os.path.exists(line):
-                    mumu_dir = os.path.dirname(line)
-                    adb_candidate = os.path.join(mumu_dir, "adb.exe")
-                    if os.path.exists(adb_candidate):
-                        return adb_candidate
-        except Exception:
-            pass
-        return None
+        came_from = {}
+        g_score = {start: 0.0}
+        f_score = {start: self._heuristic(start, goal)}
 
-    @classmethod
-    def _find_from_registry(cls) -> Optional[str]:
-        registry_keys = [
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\NetEase\MuMuPlayer"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\NetEase\MuMuPlayerGlobal"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\NetEase\MuMuPlayer"),
-            (
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\WOW6432Node\NetEase\MuMuPlayerGlobal",
-            ),
-            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\NetEase\MuMuPlayer"),
+        neighbors = [
+            (-1, 0), (1, 0), (0, -1), (0, 1),
+            (-1, -1), (-1, 1), (1, -1), (1, 1)
         ]
 
-        for hive, key_path in registry_keys:
-            try:
-                with winreg.OpenKey(hive, key_path) as key:
-                    install_dir, _ = winreg.QueryValueEx(key, "InstallDir")
-                    candidate = os.path.join(install_dir, "shell", "adb.exe")
-                    if os.path.exists(candidate):
-                        return candidate
-            except OSError:
-                continue
-        return None
+        while open_set:
+            _, current = heapq.heappop(open_set)
 
-    @classmethod
-    def _find_from_drive_scan(cls) -> Optional[str]:
-        drives = [f"{d}:\\" for d in ["C", "D", "E", "F"] if os.path.exists(f"{d}:\\")]
-        scan_patterns = [
-            r"Program Files*\NetEase\MuMuPlayer*\shell\adb.exe",
-            r"NetEase\MuMuPlayer*\shell\adb.exe",
-            r"MuMuPlayer*\shell\adb.exe",
-            r"Nemu*\vms\bin\adb.exe",
-        ]
+            if current == goal:
+                path = []
+                curr = current
+                while curr in came_from:
+                    path.append(curr)
+                    curr = came_from[curr]
+                path.append(start)
+                return path[::-1]
 
-        for drive in drives:
-            for pattern in scan_patterns:
-                matches = glob.glob(os.path.join(drive, pattern))
-                if matches and os.path.exists(matches[0]):
-                    return matches[0]
+            for dx, dy in neighbors:
+                neighbor = (current[0] + dx, current[1] + dy)
+                nx, ny = neighbor
+
+                if not (0 <= nx < self.grid_w and 0 <= ny < self.grid_h):
+                    continue
+                if self.grid[nx][ny] == 1:
+                    continue
+
+                step_cost = 1.414 if (dx != 0 and dy != 0) else 1.0
+                tentative_g_score = g_score[current] + step_cost
+
+                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f = tentative_g_score + self._heuristic(neighbor, goal)
+                    f_score[neighbor] = f
+                    heapq.heappush(open_set, (f, neighbor))
+
         return None
