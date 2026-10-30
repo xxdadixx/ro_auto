@@ -1,37 +1,39 @@
+import concurrent.futures
 import sys
 import time
-import concurrent.futures
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QPushButton,
-    QLabel,
-    QFrame,
-    QTabWidget,
-    QGridLayout,
-    QTextEdit,
-    QFormLayout,
-    QLineEdit,
-    QSpinBox,
+    QComboBox,
     QDoubleSpinBox,
+    QFormLayout,
+    QFrame,
+    QGridLayout,
     QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QRubberBand,
     QScrollArea,
-    QSplitter,
     QSizePolicy,
+    QSpinBox,
+    QSplitter,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
 from config import ADBConfig, BotConfig, VisionConfig
 from core.adb_manager import ADBManager
-from engine.instance_worker import InstanceWorker
+from engine.instance_worker import BotState, InstanceWorker
 from gui.signals import signals
 from gui.styles import LiquidGlassTheme
 from vision.vision import VisionEngine
@@ -40,15 +42,20 @@ from vision.vision import VisionEngine
 def cv_frame_to_qpixmap(
     frame: np.ndarray, width: int = 320, height: int = 180
 ) -> QPixmap:
-    """Converts OpenCV BGR image matrix to a scaled Qt QPixmap."""
+    """Converts OpenCV BGR image matrix to a scaled Qt QPixmap with memory safety guarantee."""
     if frame is None or frame.size == 0:
         return QPixmap()
+
     rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb_image.shape
     bytes_per_line = ch * w
-    q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+
+    q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+
     pixmap = QPixmap.fromImage(q_img)
-    return pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    if width > 0 and height > 0:
+        return pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.FastTransformation)
+    return pixmap
 
 
 class ADBScanWorker(QThread):
@@ -65,21 +72,206 @@ class ADBScanWorker(QThread):
         self.finished_scan.emit(devices)
 
 
+def draw_roi_overlay(
+    frame: np.ndarray,
+    roi: Optional[Tuple[int, int, int, int]],
+    color: Tuple[int, int, int] = (254, 242, 0),  # Neon Cyan/Yellow BGR
+    label: str = "SAVED ROI",
+) -> np.ndarray:
+    """Draws a high-visibility glowing bounding box overlay on the image frame matrix."""
+    if frame is None or frame.size == 0 or roi is None:
+        return frame
+
+    x, y, w, h = roi
+    fh, fw = frame.shape[:2]
+
+    if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
+        return frame
+
+    frame_copy = frame.copy()
+
+    cv2.rectangle(frame_copy, (x, y), (x + w, y + h), color, 2)
+
+    badge_text = f" {label} [{x}, {y}, {w}x{h}] "
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    thickness = 1
+    (text_w, text_h), baseline = cv2.getTextSize(
+        badge_text, font, font_scale, thickness
+    )
+
+    label_y = max(y - 6, text_h + 4)
+    cv2.rectangle(
+        frame_copy,
+        (x, label_y - text_h - 4),
+        (x + text_w, label_y + baseline),
+        (15, 21, 37),
+        -1,
+    )
+    cv2.rectangle(
+        frame_copy,
+        (x, label_y - text_h - 4),
+        (x + text_w, label_y + baseline),
+        color,
+        1,
+    )
+    cv2.putText(
+        frame_copy,
+        badge_text,
+        (x, label_y),
+        font,
+        font_scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    return frame_copy
+
+
+class InteractiveCropCanvas(QLabel):
+    """Interactive Qt Label widget enabling mouse drag-to-crop ROI selection with persistent overlay memory."""
+
+    roi_selected = Signal(tuple)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(
+            "background-color: #06090f; border: 1px solid rgba(0, 242, 254, 0.3); border-radius: 6px;"
+        )
+        self.setMinimumSize(480, 270)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self._rubber_band: Optional[QRubberBand] = None
+        self._origin_point = QPoint()
+        self._current_frame: Optional[np.ndarray] = None
+        self._cropped_frame: Optional[np.ndarray] = None
+        self._active_roi: Optional[Tuple[int, int, int, int]] = None
+
+    def set_frame(self, frame: np.ndarray) -> None:
+        """Sets active OpenCV frame buffer and updates visual display."""
+        if frame is None or frame.size == 0:
+            return
+        self._current_frame = frame.copy()
+        self._cropped_frame = None
+        self._update_display()
+
+    def set_active_roi(self, roi: Optional[Tuple[int, int, int, int]]) -> None:
+        """Stores remembered ROI coordinates and refreshes visual canvas overlay."""
+        self._active_roi = roi
+        self._update_display()
+
+    def get_cropped_frame(self) -> Optional[np.ndarray]:
+        """Returns cropped image matrix if ROI selected, otherwise full source frame."""
+        return (
+            self._cropped_frame
+            if self._cropped_frame is not None
+            else self._current_frame
+        )
+
+    def _update_display(self) -> None:
+        if self._current_frame is None:
+            return
+
+        display_matrix = self._current_frame
+        if self._active_roi is not None:
+            display_matrix = draw_roi_overlay(
+                self._current_frame, self._active_roi, label="CROP ROI"
+            )
+
+        pixmap = cv_frame_to_qpixmap(display_matrix, self.width(), self.height())
+        self.setPixmap(pixmap)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_display()
+
+    def mousePressEvent(self, event) -> None:
+        if (
+            event.button() == Qt.LeftButton
+            and self.pixmap()
+            and not self.pixmap().isNull()
+        ):
+            self._origin_point = event.pos()
+            if not self._rubber_band:
+                self._rubber_band = QRubberBand(QRubberBand.Rectangle, self)
+            self._rubber_band.setGeometry(QRect(self._origin_point, QSize()))
+            self._rubber_band.show()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._rubber_band and self._rubber_band.isVisible():
+            self._rubber_band.setGeometry(
+                QRect(self._origin_point, event.pos()).normalized()
+            )
+
+    def mouseReleaseEvent(self, event) -> None:
+        if (
+            event.button() == Qt.LeftButton
+            and self._rubber_band
+            and self._current_frame is not None
+        ):
+            self._rubber_band.hide()
+            rect = QRect(self._origin_point, event.pos()).normalized()
+
+            if rect.width() < 10 or rect.height() < 10:
+                return
+
+            pm = self.pixmap()
+            if not pm or pm.isNull():
+                return
+
+            pm_w, pm_h = pm.width(), pm.height()
+            lbl_w, lbl_h = self.width(), self.height()
+
+            offset_x = (lbl_w - pm_w) // 2
+            offset_y = (lbl_h - pm_h) // 2
+
+            adj_x1 = max(0, min(rect.left() - offset_x, pm_w))
+            adj_y1 = max(0, min(rect.top() - offset_y, pm_h))
+            adj_x2 = max(0, min(rect.right() - offset_x, pm_w))
+            adj_y2 = max(0, min(rect.bottom() - offset_y, pm_h))
+
+            crop_w = adj_x2 - adj_x1
+            crop_h = adj_y2 - adj_y1
+
+            if crop_w <= 0 or crop_h <= 0:
+                return
+
+            orig_h, orig_w = self._current_frame.shape[:2]
+            scale_x = orig_w / float(pm_w)
+            scale_y = orig_h / float(pm_h)
+
+            real_x = int(adj_x1 * scale_x)
+            real_y = int(adj_y1 * scale_y)
+            real_w = int(crop_w * scale_x)
+            real_h = int(crop_h * scale_y)
+
+            self._cropped_frame = self._current_frame[
+                real_y : real_y + real_h, real_x : real_x + real_w
+            ].copy()
+
+            self._active_roi = (real_x, real_y, real_w, real_h)
+            self._update_display()
+            self.roi_selected.emit(self._active_roi)
+
+
 class InstanceCardWidget(QFrame):
-    """Native widget card representing a single emulator instance with responsive layout."""
+    """Native widget card representing a single emulator instance with live ROI overlay support."""
 
     def __init__(self, serial: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.serial = serial
+        self._is_running = False
         self.setObjectName("glassPanel")
-        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.setMinimumWidth(340)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setFixedWidth(344)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        # Fixed-Height Header Row
+        # Header Row
         header_widget = QWidget()
         header_widget.setFixedHeight(28)
         header_layout = QHBoxLayout(header_widget)
@@ -104,11 +296,10 @@ class InstanceCardWidget(QFrame):
         header_layout.addWidget(self.state_badge)
         layout.addWidget(header_widget)
 
-        # Video Stream Canvas Container
+        # Stream Canvas
         self.canvas = QLabel("Connecting Stream...")
         self.canvas.setAlignment(Qt.AlignCenter)
-        self.canvas.setMinimumSize(320, 180)
-        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.canvas.setFixedSize(320, 180)
         self.canvas.setStyleSheet(
             "background-color: #06090f; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px;"
         )
@@ -120,22 +311,41 @@ class InstanceCardWidget(QFrame):
         self.btn_toggle.clicked.connect(self._on_toggle)
         layout.addWidget(self.btn_toggle)
 
-    def update_frame(self, frame: np.ndarray) -> None:
-        pixmap = cv_frame_to_qpixmap(frame, self.canvas.width(), self.canvas.height())
+    def update_frame(
+        self,
+        frame: np.ndarray,
+        active_roi: Optional[Tuple[int, int, int, int]] = None,
+    ) -> None:
+        """Renders live instance frame with remembered ROI bounding box overlay."""
+        if frame is None or frame.size == 0:
+            return
+
+        display_frame = frame
+        if active_roi is not None:
+            display_frame = draw_roi_overlay(frame, active_roi, label="ACTIVE ROI")
+
+        pixmap = cv_frame_to_qpixmap(display_frame, 320, 180)
         if not pixmap.isNull():
             self.canvas.setPixmap(pixmap)
 
     def update_state(self, state_str: str) -> None:
         self.state_badge.setText(state_str)
+        if state_str == "STOPPED":
+            self._is_running = False
+            self.btn_toggle.setText("Start Instance")
+        else:
+            self._is_running = True
+            self.btn_toggle.setText("Stop Instance")
 
     def _on_toggle(self) -> None:
-        is_running = self.btn_toggle.text() == "Stop Instance"
         window = self.window()
-        if is_running:
+        if self._is_running:
+            self._is_running = False
             self.btn_toggle.setText("Start Instance")
             if hasattr(window, "stop_worker"):
                 window.stop_worker(self.serial)
         else:
+            self._is_running = True
             self.btn_toggle.setText("Stop Instance")
             if hasattr(window, "start_worker"):
                 window.start_worker(self.serial)
@@ -150,8 +360,9 @@ class MainWindow(QMainWindow):
         self.resize(1400, 900)
         self.setStyleSheet(LiquidGlassTheme.MAIN_QSS)
 
-        # Lifecycle State Flags
+        # Lifecycle State Flags & Active Targets
         self._is_shutting_down = False
+        self.active_roi: Optional[Tuple[int, int, int, int]] = None
 
         # Initialize Core Backend Components
         self.adb_mgr = ADBManager()
@@ -212,7 +423,7 @@ class MainWindow(QMainWindow):
         # Main Splitter Dashboard Layout
         splitter = QSplitter(Qt.Vertical)
 
-        tabs = QTabWidget()
+        self.tabs = QTabWidget()
 
         # Tab 1: Live Instances Grid
         self.grid_scroll = QScrollArea()
@@ -222,13 +433,16 @@ class MainWindow(QMainWindow):
         self.grid_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.grid_layout.setSpacing(16)
         self.grid_scroll.setWidget(self.grid_widget)
-        tabs.addTab(self.grid_scroll, "📺 Live Instances")
+        self.tabs.addTab(self.grid_scroll, "📺 Live Instances")
 
         # Tab 2 & 3: Workbench and Inspector
-        tabs.addTab(self._build_vision_bench(), "👁 Vision & OCR Bench")
-        tabs.addTab(self._build_config_inspector(), "⚙ Config Inspector")
+        self.tabs.addTab(self._build_vision_bench(), "👁 Vision & OCR Bench")
+        self.tabs.addTab(self._build_config_inspector(), "⚙ Config Inspector")
 
-        splitter.addWidget(tabs)
+        # Automatically refresh dropdown items when switching to Vision Bench
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        splitter.addWidget(self.tabs)
 
         # Terminal Log Panel
         log_panel = QFrame()
@@ -256,34 +470,270 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(splitter)
 
+    def _on_tab_changed(self, index: int) -> None:
+        """Triggers dynamic dropdown refresh when switching tabs."""
+        if index == 1:  # Vision & OCR Bench tab
+            self._update_instance_combo()
+
+    def _update_instance_combo(self) -> None:
+        """Populates instance selection dropdown with active ADB devices while preserving selection."""
+        if not hasattr(self, "combo_instances"):
+            return
+
+        current_serial = self.combo_instances.currentData()
+        self.combo_instances.blockSignals(True)
+        self.combo_instances.clear()
+
+        for serial in self.workers.keys():
+            self.combo_instances.addItem(f"📱 {serial}", userData=serial)
+
+        # Restore previous selection or default to first instance
+        index_to_select = -1
+        if current_serial:
+            for i in range(self.combo_instances.count()):
+                if self.combo_instances.itemData(i) == current_serial:
+                    index_to_select = i
+                    break
+
+        if index_to_select >= 0:
+            self.combo_instances.setCurrentIndex(index_to_select)
+        elif self.combo_instances.count() > 0:
+            self.combo_instances.setCurrentIndex(0)
+
+        self.combo_instances.blockSignals(False)
+
     def _build_vision_bench(self) -> QWidget:
+        """Constructs interactive Vision & OCR Workbench with target execution mode selection."""
         bench = QWidget()
         layout = QHBoxLayout(bench)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(12)
 
-        left_box = QGroupBox("Template & ROI Testing")
+        # Left Panel: Interactive Crop Canvas
+        left_box = QGroupBox("📸 Interactive Live Frame Selector & Cropper")
         left_box.setObjectName("glassPanel")
-        form = QFormLayout(left_box)
+        left_layout = QVBoxLayout(left_box)
 
-        form.addRow("Template File:", QLineEdit("templates/quest_button.png"))
-        form.addRow(
-            "Matching Threshold:",
-            QDoubleSpinBox(value=0.75, maximum=1.0, singleStep=0.05),
+        # Controls Toolbar
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("Instance Source:"))
+        self.combo_instances = QComboBox()
+        self.combo_instances.setMinimumWidth(160)
+        toolbar.addWidget(self.combo_instances)
+
+        btn_capture = QPushButton("📷 Snap Current Frame")
+        btn_capture.clicked.connect(self._on_capture_vision_frame)
+        toolbar.addWidget(btn_capture)
+
+        btn_clear_roi = QPushButton("🗑 Clear Target", objectName="dangerButton")
+        btn_clear_roi.clicked.connect(self._clear_saved_roi)
+        toolbar.addWidget(btn_clear_roi)
+
+        toolbar.addStretch()
+        left_layout.addLayout(toolbar)
+
+        # Canvas
+        self.crop_canvas = InteractiveCropCanvas()
+        self.crop_canvas.roi_selected.connect(self._on_roi_selected)
+        left_layout.addWidget(self.crop_canvas)
+
+        self.lbl_crop_info = QLabel(
+            "💡 Tip: Drag to crop a button/dialog, then select an execution mode below."
         )
-        btn_run_match = QPushButton("Test Template Match")
-        form.addRow(btn_run_match)
+        self.lbl_crop_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        left_layout.addWidget(self.lbl_crop_info)
 
-        layout.addWidget(left_box)
+        layout.addWidget(left_box, stretch=3)
 
-        right_box = QGroupBox("EasyOCR Thai Text Parsing")
+        # Right Panel: OCR & Target Dispatcher
+        right_box = QGroupBox("👁 OCR & Target Dispatcher")
         right_box.setObjectName("glassPanel")
-        ocr_layout = QVBoxLayout(right_box)
-        ocr_layout.addWidget(QLabel("Extracted String Stream:"))
-        ocr_text = QTextEdit()
-        ocr_text.setObjectName("terminalLog")
-        ocr_layout.addWidget(ocr_text)
+        right_layout = QVBoxLayout(right_box)
 
-        layout.addWidget(right_box)
+        right_layout.addWidget(QLabel("Selected Crop Region Preview:"))
+        self.lbl_crop_preview = QLabel("No Region Selected")
+        self.lbl_crop_preview.setAlignment(Qt.AlignCenter)
+        self.lbl_crop_preview.setFixedHeight(110)
+        self.lbl_crop_preview.setStyleSheet(
+            "background-color: #06090f; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px;"
+        )
+        right_layout.addWidget(self.lbl_crop_preview)
+
+        # Target Mode Option Dropdown
+        right_layout.addWidget(QLabel("Target Execution Mode:"))
+        self.combo_target_mode = QComboBox()
+        self.combo_target_mode.addItem(
+            "⚡ One-Shot Click & Resume Questing", userData=True
+        )
+        self.combo_target_mode.addItem("🔄 Continuous Target Clicker", userData=False)
+        right_layout.addWidget(self.combo_target_mode)
+
+        # Dispatcher Button
+        btn_set_target = QPushButton("🎯 Apply Target to All Instances")
+        btn_set_target.setFixedHeight(36)
+        btn_set_target.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00c6ff, stop:1 #0072ff);"
+            "color: #ffffff; font-weight: bold; font-size: 12px; border-radius: 6px;"
+        )
+        btn_set_target.clicked.connect(self._on_set_target_all)
+        right_layout.addWidget(btn_set_target)
+
+        btn_run_ocr = QPushButton("🔤 Extract Thai OCR Text")
+        btn_run_ocr.setFixedHeight(30)
+        btn_run_ocr.clicked.connect(self._on_run_bench_ocr)
+        right_layout.addWidget(btn_run_ocr)
+
+        right_layout.addWidget(QLabel("Extracted Text Stream / Target Status:"))
+        self.ocr_bench_output = QTextEdit()
+        self.ocr_bench_output.setObjectName("terminalLog")
+        right_layout.addWidget(self.ocr_bench_output)
+
+        layout.addWidget(right_box, stretch=2)
         return bench
+
+    def _on_set_target_all(self) -> None:
+        """Broadcasts cropped target image matrix and execution mode to all active workers."""
+        cropped_matrix = self.crop_canvas.get_cropped_frame()
+        if cropped_matrix is None or cropped_matrix.size == 0:
+            self.ocr_bench_output.setText(
+                "⚠️ Please capture a frame and crop a target image first."
+            )
+            return
+
+        if not self.workers:
+            self.ocr_bench_output.setText(
+                "⚠️ No running or discovered instances available to assign target."
+            )
+            return
+
+        is_one_shot = bool(self.combo_target_mode.currentData())
+
+        count = 0
+        for serial, worker in self.workers.items():
+            worker.active_target_template = cropped_matrix.copy()
+            worker.active_target_roi = self.active_roi
+            worker.one_shot_target = is_one_shot
+            worker.state = BotState.CHECK_QUEST
+            count += 1
+
+        mode_str = "One-Shot & Resume" if is_one_shot else "Continuous"
+        msg = f"✅ Target ({mode_str}) assigned to {count} instance(s)! Quest automation active."
+        self.ocr_bench_output.setText(msg)
+        self.lbl_crop_info.setText(
+            f"🎯 Active Target Mode: {mode_str} across {count} instance(s)."
+        )
+
+        signals.log_emitted.emit(
+            "INFO",
+            "ACTION",
+            f"Broadcast dynamic target ({mode_str}) to {count} instance(s).",
+            "SYSTEM",
+        )
+
+    def _clear_saved_roi(self) -> None:
+        """Clears remembered target coordinates and resets dynamic targets across all instances."""
+        self.active_roi = None
+        self.crop_canvas.set_active_roi(None)
+        self.lbl_crop_preview.setText("No Region Selected")
+        self.lbl_crop_preview.setPixmap(QPixmap())
+        self.lbl_crop_info.setText("🗑 Saved ROI Overlay cleared.")
+
+        for worker in self.workers.values():
+            worker.active_target_template = None
+            worker.active_target_roi = None
+
+        self.ocr_bench_output.setText(
+            "Cleared active target from all instance workers."
+        )
+        signals.log_emitted.emit(
+            "WARN",
+            "VISION",
+            "Cleared active ROI and dynamic targets from all instances.",
+            "SYSTEM",
+        )
+
+    def _on_capture_vision_frame(self) -> None:
+        """Captures a live frame snapshot from the selected ADB instance for cropping."""
+        if self.combo_instances.count() == 0:
+            self._update_instance_combo()
+
+        if self.combo_instances.count() == 0:
+            self.lbl_crop_info.setText(
+                "⚠️ No active ADB instances found. Click 'Rescan ADB' first."
+            )
+            return
+
+        target_serial = self.combo_instances.currentData()
+        if not target_serial:
+            target_serial = (
+                self.combo_instances.currentText().replace("📱 ", "").strip()
+            )
+
+        if not target_serial or target_serial not in self.workers:
+            self.lbl_crop_info.setText(
+                "⚠️ Selected instance is invalid or disconnected."
+            )
+            return
+
+        self.lbl_crop_info.setText(f"⏳ Capturing frame from {target_serial}...")
+        QApplication.processEvents()
+
+        frame = self.adb_mgr.capture_frame(target_serial)
+        if frame is not None:
+            self.crop_canvas.set_frame(frame)
+            self.lbl_crop_info.setText(
+                f"✅ Frame captured from {target_serial} ({frame.shape[1]}x{frame.shape[0]}px). Drag to crop region."
+            )
+            self.lbl_crop_preview.setText("Full Frame Active (Drag to crop region)")
+            self.lbl_crop_preview.setPixmap(QPixmap())
+        else:
+            self.lbl_crop_info.setText(
+                f"❌ Failed to capture frame from {target_serial}."
+            )
+
+    @Slot(tuple)
+    def _on_roi_selected(self, roi: Tuple[int, int, int, int]) -> None:
+        """Handles ROI selection signal from canvas and updates crop preview label."""
+        self.active_roi = roi
+        x, y, w, h = roi
+        self.lbl_crop_info.setText(
+            f"📐 Saved ROI Overlay: X={x}, Y={y}, Width={w}px, Height={h}px"
+        )
+
+        cropped = self.crop_canvas.get_cropped_frame()
+        if cropped is not None and cropped.size > 0:
+            pixmap = cv_frame_to_qpixmap(
+                cropped, self.lbl_crop_preview.width(), self.lbl_crop_preview.height()
+            )
+            self.lbl_crop_preview.setPixmap(pixmap)
+
+        signals.log_emitted.emit(
+            "INFO", "VISION", f"Active ROI overlay saved: {roi}", "SYSTEM"
+        )
+
+    def _on_run_bench_ocr(self) -> None:
+        """Executes Thai EasyOCR on the currently cropped image region."""
+        target_img = self.crop_canvas.get_cropped_frame()
+        if target_img is None or target_img.size == 0:
+            self.ocr_bench_output.setText(
+                "⚠️ Please capture a frame and crop a region first."
+            )
+            return
+
+        self.ocr_bench_output.setText("⏳ Processing EasyOCR text recognition...")
+        QApplication.processEvents()
+
+        try:
+            text_results = self.vision.read_thai_text(target_img)
+            if text_results:
+                formatted = "\n".join([f"• {text}" for text in text_results])
+                self.ocr_bench_output.setText(formatted)
+            else:
+                self.ocr_bench_output.setText(
+                    "⚠️ No Thai text detected in selected crop region."
+                )
+        except Exception as err:
+            self.ocr_bench_output.setText(f"❌ OCR Error: {err}")
 
     def _build_config_inspector(self) -> QWidget:
         inspector = QWidget()
@@ -314,6 +764,7 @@ class MainWindow(QMainWindow):
             "WARN": "#fbbf24",
             "ERROR": "#f87171",
             "ADB": "#c084fc",
+            "ACTION": "#a855f7",
         }
         color = color_map.get(level, "#f1f5f9")
         formatted = f'<span style="color:#64748b">[{timestamp}]</span> <span style="color:{color}"><b>[{level}]</b> [{tag}] ({serial}): {message}</span>'
@@ -326,8 +777,9 @@ class MainWindow(QMainWindow):
 
     @Slot(str, object)
     def on_frame_ready(self, serial: str, frame: np.ndarray) -> None:
+        """Renders live instance frames with remembered ROI bounding box overlay."""
         if not self._is_shutting_down and serial in self.worker_cards:
-            self.worker_cards[serial].update_frame(frame)
+            self.worker_cards[serial].update_frame(frame, self.active_roi)
 
     def rescan_adb(self) -> None:
         """Launches ADB scanning asynchronously to prevent main thread blocking."""
@@ -345,24 +797,50 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def _on_scan_finished(self, devices: List[str]) -> None:
+        """Handles scan completion by registering new instances and updating dropdowns."""
         if self._is_shutting_down:
             return
 
         self.btn_rescan.setEnabled(True)
         self.btn_rescan.setText("🔄 Rescan ADB")
 
+        # Step 1: Remove cards for devices that were deduplicated or closed
+        stale_serials = [s for s in list(self.workers.keys()) if s not in devices]
+        for serial in stale_serials:
+            if serial in self.workers:
+                self.workers[serial].stop()
+                del self.workers[serial]
+            if serial in self.worker_cards:
+                card = self.worker_cards.pop(serial)
+                self.grid_layout.removeWidget(card)
+                card.deleteLater()
+                signals.log_emitted.emit(
+                    "WARN",
+                    "ADB",
+                    f"Pruned duplicate/stale instance card {serial}",
+                    serial,
+                )
+
+        # Step 2: Register new instance workers and cards
         for serial in devices:
             if serial not in self.workers:
                 self.workers[serial] = InstanceWorker(serial, self.adb_mgr, self.vision)
                 card = InstanceCardWidget(serial)
                 self.worker_cards[serial] = card
-
-                idx = len(self.worker_cards) - 1
-                row, col = divmod(idx, 2)
-                self.grid_layout.addWidget(card, row, col)
                 signals.log_emitted.emit(
                     "INFO", "ADB", f"Registered instance {serial}", serial
                 )
+
+        # Step 3: Reflow active cards and refresh Vision Bench instance selector
+        self._relayout_cards()
+        self._update_instance_combo()
+
+    def _relayout_cards(self) -> None:
+        """Re-arranges active instance cards dynamically in a 2-column grid."""
+        for idx, (serial, card) in enumerate(self.worker_cards.items()):
+            self.grid_layout.removeWidget(card)
+            row, col = divmod(idx, 2)
+            self.grid_layout.addWidget(card, row, col)
 
     def start_worker(self, serial: str) -> None:
         if self._is_shutting_down:
@@ -387,7 +865,7 @@ class MainWindow(QMainWindow):
             self.stop_worker(serial)
 
     def _poll_idle_frames_async(self) -> None:
-        """Captures idle frames in background thread pool with defensive exception boundaries."""
+        """Captures idle frames in background thread pool without queue flooding."""
         if self._is_shutting_down:
             return
 
@@ -406,22 +884,25 @@ class MainWindow(QMainWindow):
             signals.frame_ready.emit(serial, frame)
 
     def closeEvent(self, event) -> None:
-        """Performs graceful shutdown of timers, scan threads, and thread pools."""
+        """Performs graceful shutdown of timers, scan threads, signal bindings, and thread pools."""
         self._is_shutting_down = True
 
-        # Stop periodic timers
+        try:
+            signals.log_emitted.disconnect(self.append_log)
+            signals.state_changed.disconnect(self.on_state_changed)
+            signals.frame_ready.disconnect(self.on_frame_ready)
+        except (RuntimeError, TypeError):
+            pass
+
         if hasattr(self, "idle_timer") and self.idle_timer.isActive():
             self.idle_timer.stop()
 
-        # Stop ADB scanning worker thread if active
         if self.scan_worker and self.scan_worker.isRunning():
             self.scan_worker.quit()
             self.scan_worker.wait(1000)
 
-        # Signal workers to stop
         self.stop_all()
 
-        # Shutdown executor pool without raising scheduling errors
         try:
             self.executor.shutdown(wait=False, cancel_futures=True)
         except Exception:

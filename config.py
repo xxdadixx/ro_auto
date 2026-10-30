@@ -19,10 +19,11 @@ class ADBConfig:
     host: str = "127.0.0.1"
     default_port: int = 7555
     start_port: int = 16384
-    max_ports: int = 20
-    connection_timeout: float = 0.5
+    port_stride: int = 32
+    max_instances: int = 32
+    connection_timeout: float = 0.3
 
-    # Corrected backslash between 'shell' directory and 'adb.exe' binary
+    # Custom ADB path
     custom_adb_path: Optional[str] = (
         r"E:\Program Files\Netease\MuMuPlayer\nx_device\15.0\shell\adb.exe"
     )

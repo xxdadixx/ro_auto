@@ -18,7 +18,7 @@ class BotState(Enum):
 
 
 class InstanceWorker:
-    """Isolated state machine worker handling a single MuMuPlayer instance."""
+    """Isolated state machine worker handling dynamic target matching and quest navigation concurrency."""
 
     def __init__(
         self,
@@ -33,6 +33,14 @@ class InstanceWorker:
         self.config = config
         self.state = BotState.INIT
         self.is_running = False
+
+        # User-defined dynamic click target matrix and ROI overlay
+        self.active_target_template: Optional[np.ndarray] = None
+        self.active_target_roi: Optional[tuple] = None
+
+        # Mode flag: True = consume target on click & resume questing; False = continuous scan
+        self.one_shot_target: bool = True
+        self._last_target_click_time: float = 0.0
 
     def run(self) -> None:
         """Main execution loop sharing captured frames directly with the UI."""
@@ -49,9 +57,7 @@ class InstanceWorker:
                     time.sleep(1.0)
                     continue
 
-                # Pass captured frame directly to UI without spawning extra adb.exe processes
                 signals.frame_ready.emit(self.device_serial, frame)
-
                 self._process_state(frame)
             except Exception as err:
                 signals.log_emitted.emit(
@@ -66,7 +72,47 @@ class InstanceWorker:
         signals.state_changed.emit(self.device_serial, "STOPPED")
 
     def _process_state(self, frame: np.ndarray) -> None:
-        """Executes state-specific logic and transition rules."""
+        """Executes dynamic target matching while maintaining state machine quest progression."""
+        current_time = time.time()
+
+        # Step 1: Check dynamic user crop target if assigned
+        if (
+            self.active_target_template is not None
+            and self.active_target_template.size > 0
+            and (current_time - self._last_target_click_time) > 1.0
+        ):
+            click_coord = self.vision.match_template_matrix(
+                frame,
+                self.active_target_template,
+                threshold=0.70,
+                roi=self.active_target_roi,
+            )
+            if click_coord:
+                signals.log_emitted.emit(
+                    "INFO",
+                    "ACTION",
+                    f"🎯 Dynamic target found at {click_coord}. Executing tap!",
+                    self.device_serial,
+                )
+                self.adb.tap(self.device_serial, click_coord[0], click_coord[1])
+                self._last_target_click_time = current_time
+
+                # Auto-consume target if set to one-shot mode
+                if self.one_shot_target:
+                    self.active_target_template = None
+                    signals.log_emitted.emit(
+                        "INFO",
+                        "STATE",
+                        "One-shot target consumed. Resuming auto quest progression.",
+                        self.device_serial,
+                    )
+
+                # Reset state to CHECK_QUEST to ensure immediate quest progression
+                self.state = BotState.CHECK_QUEST
+                signals.state_changed.emit(self.device_serial, self.state.name)
+                time.sleep(0.3)
+
+        # Step 2: Standard Quest State Machine Execution (No early return starvation)
         match self.state:
             case BotState.INIT:
                 self.state = BotState.CHECK_QUEST
@@ -87,18 +133,8 @@ class InstanceWorker:
                     self.state = BotState.HANDLE_DIALOG
                     signals.state_changed.emit(self.device_serial, self.state.name)
                 else:
-                    texts = self.vision.read_thai_text(frame, roi=self.config.quest_roi)
-                    if any("เควส" in text or "ส่งเควส" for text in texts):
-                        signals.log_emitted.emit(
-                            "INFO",
-                            "OCR",
-                            "Thai Quest text detected.",
-                            self.device_serial,
-                        )
-                        self.adb.tap(self.device_serial, 100, 250)
-                    else:
-                        self.state = BotState.AUTO_BATTLE
-                        signals.state_changed.emit(self.device_serial, self.state.name)
+                    self.state = BotState.AUTO_BATTLE
+                    signals.state_changed.emit(self.device_serial, self.state.name)
 
             case BotState.HANDLE_DIALOG:
                 confirm_coord = self.vision.match_template(
