@@ -24,9 +24,7 @@ class ADBConfig:
     connection_timeout: float = 0.3
 
     # Custom ADB path
-    custom_adb_path: Optional[str] = (
-        r"E:\Program Files\Netease\MuMuPlayer\nx_device\15.0\shell\adb.exe"
-    )
+    custom_adb_path: Optional[str] = None
 
 
 @dataclass(frozen=True)

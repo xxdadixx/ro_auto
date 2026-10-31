@@ -1,6 +1,7 @@
 import concurrent.futures
 import sys
 import time
+import html
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -59,16 +60,33 @@ def cv_frame_to_qpixmap(
 
 
 class ADBScanWorker(QThread):
-    """Background thread worker to discover ADB instances without freezing the UI."""
+    """Background worker for discovering ADB instances."""
 
     finished_scan = Signal(list)
+    failed_scan = Signal(str)
 
     def __init__(self, adb_mgr: ADBManager) -> None:
         super().__init__()
         self.adb_mgr = adb_mgr
 
     def run(self) -> None:
-        devices = self.adb_mgr.scan_mumu_instances()
+        """Distinguish an empty successful scan from an actual scan failure."""
+        try:
+            devices = self.adb_mgr.scan_mumu_instances()
+
+        except Exception as exc:
+            message = str(exc)
+
+            signals.log_emitted.emit(
+                "ERROR",
+                "ADB",
+                f"Device scan failed: {message}",
+                "SYSTEM",
+            )
+
+            self.failed_scan.emit(message)
+            return
+
         self.finished_scan.emit(devices)
 
 
@@ -221,16 +239,50 @@ class InteractiveCropCanvas(QLabel):
         self._active_roi: Optional[Tuple[int, int, int, int]] = None
 
     def set_frame(self, frame: np.ndarray) -> None:
-        """Sets active OpenCV frame buffer and updates visual display."""
-        if frame is None or frame.size == 0:
+        """Replace the source image and invalidate all previous crop state."""
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
             return
+
         self._current_frame = frame.copy()
         self._cropped_frame = None
+        self._active_roi = None
+
         self._update_display()
 
-    def set_active_roi(self, roi: Optional[Tuple[int, int, int, int]]) -> None:
-        """Stores remembered ROI coordinates and refreshes visual canvas overlay."""
-        self._active_roi = roi
+    def set_active_roi(
+        self,
+        roi: Optional[Tuple[int, int, int, int]],
+    ) -> None:
+        """Update the ROI and discard stale crop data when the ROI is cleared."""
+        if roi is None:
+            self._active_roi = None
+            self._cropped_frame = None
+
+        else:
+            if self._current_frame is None or len(roi) != 4:
+                return
+
+            x, y, width, height = map(int, roi)
+
+            frame_h, frame_w = self._current_frame.shape[:2]
+
+            if (
+                x < 0
+                or y < 0
+                or width <= 0
+                or height <= 0
+                or x + width > frame_w
+                or y + height > frame_h
+            ):
+                return
+
+            self._active_roi = (x, y, width, height)
+
+            self._cropped_frame = self._current_frame[
+                y : y + height,
+                x : x + width,
+            ].copy()
+
         self._update_display()
 
     def get_cropped_frame(self) -> Optional[np.ndarray]:
@@ -485,13 +537,25 @@ class MainWindow(QMainWindow):
         self.vision = VisionEngine(use_gpu=False)
         self.workers: Dict[str, InstanceWorker] = {}
         self.worker_cards: Dict[str, InstanceCardWidget] = {}
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        self.worker_futures: Dict[str, concurrent.futures.Future] = {}
+
+        self.idle_frame_futures: Dict[str, concurrent.futures.Future] = {}
+
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=ADBConfig().max_instances + 4,
+            thread_name_prefix="instance-worker",
+        )
         self.scan_worker: Optional[ADBScanWorker] = None
 
-        # Connect Global Signals
+        # Request IDs prevent stale background results from updating the UI.
+        self._capture_request_id = 0
+        self._ocr_request_id = 0
+
+        # Connect Global Signals owned by MainWindow.
         signals.log_emitted.connect(self.append_log)
         signals.state_changed.connect(self.on_state_changed)
         signals.frame_ready.connect(self.on_frame_ready)
+        signals.ui_task_finished.connect(self._on_ui_task_finished)
 
         self._build_ui()
 
@@ -585,6 +649,93 @@ class MainWindow(QMainWindow):
         splitter.setSizes([600, 250])
 
         main_layout.addWidget(splitter)
+
+    def _publish_ui_task_result(
+        self,
+        operation: str,
+        request_id: int,
+        serial: str,
+        future: concurrent.futures.Future,
+    ) -> None:
+        """Publish background task results through the Qt signal bridge."""
+        try:
+            result = future.result()
+            error_message = ""
+
+        except Exception as exc:
+            result = None
+            error_message = str(exc)
+
+        signals.ui_task_finished.emit(
+            operation,
+            request_id,
+            serial,
+            result,
+            error_message,
+        )
+
+    @Slot(str, int, str, object, str)
+    def _on_ui_task_finished(
+        self,
+        operation: str,
+        request_id: int,
+        serial: str,
+        result: object,
+        error_message: str,
+    ) -> None:
+        """Apply completed background operations on the GUI thread."""
+        if self._is_shutting_down:
+            return
+
+        if operation == "capture":
+            if request_id != self._capture_request_id:
+                return
+
+            if error_message:
+                self.lbl_crop_info.setText(
+                    f"❌ Frame capture failed for {serial}: {error_message}"
+                )
+                return
+
+            if not isinstance(result, np.ndarray) or result.size == 0:
+                self.lbl_crop_info.setText(f"❌ Failed to capture frame from {serial}.")
+                return
+
+            self.active_roi = None
+
+            self.crop_canvas.set_frame(result)
+
+            self.lbl_crop_preview.setText("Full Frame Active (Drag to crop region)")
+
+            self.lbl_crop_preview.setPixmap(QPixmap())
+
+            self.lbl_crop_info.setText(
+                f"✅ Frame captured from {serial} "
+                f"({result.shape[1]}x{result.shape[0]}px). "
+                "Drag to crop region."
+            )
+
+            return
+
+        if operation == "ocr":
+            if request_id != self._ocr_request_id:
+                return
+
+            if error_message:
+                self.ocr_bench_output.setPlainText(f"❌ OCR Error: {error_message}")
+                return
+
+            text_results = result if isinstance(result, list) else []
+
+            if text_results:
+                formatted = "\n".join(f"• {str(item)}" for item in text_results)
+
+                self.ocr_bench_output.setPlainText(formatted)
+
+            else:
+                self.ocr_bench_output.setPlainText(
+                    "⚠️ No Thai text detected in selected crop region."
+                )
 
     def _on_tab_changed(self, index: int) -> None:
         """Triggers dynamic dropdown refresh when switching tabs."""
@@ -708,33 +859,44 @@ class MainWindow(QMainWindow):
         return bench
 
     def _on_set_target_all(self) -> None:
-        """Broadcasts cropped target image matrix and execution mode to all active workers."""
+        """Broadcast a valid cropped template to all discovered instances."""
         cropped_matrix = self.crop_canvas.get_cropped_frame()
-        if cropped_matrix is None or cropped_matrix.size == 0:
+
+        if (
+            self.active_roi is None
+            or cropped_matrix is None
+            or cropped_matrix.size == 0
+        ):
             self.ocr_bench_output.setText(
-                "⚠️ Please capture a frame and crop a target image first."
+                "⚠️ Please capture a frame and select a crop region first."
             )
             return
 
         if not self.workers:
             self.ocr_bench_output.setText(
-                "⚠️ No running or discovered instances available to assign target."
+                "⚠️ No discovered instances are available to assign the target."
             )
             return
 
         is_one_shot = bool(self.combo_target_mode.currentData())
 
-        count = 0
-        for serial, worker in self.workers.items():
-            worker.active_target_template = cropped_matrix.copy()
-            worker.active_target_roi = self.active_roi
+        target_roi = tuple(self.active_roi)
+        target_template = cropped_matrix.copy()
+
+        for worker in list(self.workers.values()):
+            worker.active_target_template = target_template
+            worker.active_target_roi = target_roi
             worker.one_shot_target = is_one_shot
             worker.state = BotState.CHECK_QUEST
-            count += 1
+
+        count = len(self.workers)
 
         mode_str = "One-Shot & Resume" if is_one_shot else "Continuous"
-        msg = f"✅ Target ({mode_str}) assigned to {count} instance(s)! Quest automation active."
-        self.ocr_bench_output.setText(msg)
+
+        self.ocr_bench_output.setText(
+            f"✅ Target ({mode_str}) assigned to {count} instance(s)."
+        )
+
         self.lbl_crop_info.setText(
             f"🎯 Active Target Mode: {mode_str} across {count} instance(s)."
         )
@@ -749,6 +911,7 @@ class MainWindow(QMainWindow):
     def _clear_saved_roi(self) -> None:
         """Clears remembered target coordinates and resets dynamic targets across all instances."""
         self.active_roi = None
+        self._ocr_request_id += 1
         self.crop_canvas.set_active_roi(None)
         self.lbl_crop_preview.setText("No Region Selected")
         self.lbl_crop_preview.setPixmap(QPixmap())
@@ -769,7 +932,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_capture_vision_frame(self) -> None:
-        """Captures a live frame snapshot from the selected ADB instance for cropping."""
+        """Capture the selected emulator frame without blocking the GUI."""
         if self.combo_instances.count() == 0:
             self._update_instance_combo()
 
@@ -780,6 +943,7 @@ class MainWindow(QMainWindow):
             return
 
         target_serial = self.combo_instances.currentData()
+
         if not target_serial:
             target_serial = (
                 self.combo_instances.currentText().replace("📱 ", "").strip()
@@ -791,26 +955,41 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.lbl_crop_info.setText(f"⏳ Capturing frame from {target_serial}...")
-        QApplication.processEvents()
+        self._capture_request_id += 1
+        self._ocr_request_id += 1
 
-        frame = self.adb_mgr.capture_frame(target_serial)
-        if frame is not None:
-            self.crop_canvas.set_frame(frame)
-            self.lbl_crop_info.setText(
-                f"✅ Frame captured from {target_serial} ({frame.shape[1]}x{frame.shape[0]}px). Drag to crop region."
+        request_id = self._capture_request_id
+
+        # Invalidate the old crop while a new frame is being captured.
+        self.active_roi = None
+        self.crop_canvas.set_active_roi(None)
+
+        self.lbl_crop_info.setText(f"⏳ Capturing frame from {target_serial}...")
+
+        try:
+            future = self.executor.submit(
+                self.adb_mgr.capture_frame,
+                target_serial,
             )
-            self.lbl_crop_preview.setText("Full Frame Active (Drag to crop region)")
-            self.lbl_crop_preview.setPixmap(QPixmap())
-        else:
-            self.lbl_crop_info.setText(
-                f"❌ Failed to capture frame from {target_serial}."
+
+        except RuntimeError as exc:
+            self.lbl_crop_info.setText(f"❌ Could not schedule frame capture: {exc}")
+            return
+
+        future.add_done_callback(
+            lambda completed, rid=request_id, serial=target_serial: self._publish_ui_task_result(
+                "capture",
+                rid,
+                serial,
+                completed,
             )
+        )
 
     @Slot(tuple)
     def _on_roi_selected(self, roi: Tuple[int, int, int, int]) -> None:
         """Handles ROI selection signal from canvas and updates crop preview label."""
         self.active_roi = roi
+        self._ocr_request_id += 1
         x, y, w, h = roi
         self.lbl_crop_info.setText(
             f"📐 Saved ROI Overlay: X={x}, Y={y}, Width={w}px, Height={h}px"
@@ -828,28 +1007,46 @@ class MainWindow(QMainWindow):
         )
 
     def _on_run_bench_ocr(self) -> None:
-        """Executes Thai EasyOCR on the currently cropped image region."""
-        target_img = self.crop_canvas.get_cropped_frame()
-        if target_img is None or target_img.size == 0:
-            self.ocr_bench_output.setText(
+        """Execute EasyOCR outside the GUI thread using a copied image."""
+        if self.active_roi is None:
+            self.ocr_bench_output.setPlainText(
                 "⚠️ Please capture a frame and crop a region first."
             )
             return
 
-        self.ocr_bench_output.setText("⏳ Processing EasyOCR text recognition...")
-        QApplication.processEvents()
+        target_img = self.crop_canvas.get_cropped_frame()
+
+        if target_img is None or target_img.size == 0:
+            self.ocr_bench_output.setPlainText(
+                "⚠️ Please capture a frame and crop a region first."
+            )
+            return
+
+        self._ocr_request_id += 1
+
+        request_id = self._ocr_request_id
+        image_copy = target_img.copy()
+
+        self.ocr_bench_output.setPlainText("⏳ Processing EasyOCR text recognition...")
 
         try:
-            text_results = self.vision.read_thai_text(target_img)
-            if text_results:
-                formatted = "\n".join([f"• {text}" for text in text_results])
-                self.ocr_bench_output.setText(formatted)
-            else:
-                self.ocr_bench_output.setText(
-                    "⚠️ No Thai text detected in selected crop region."
-                )
-        except Exception as err:
-            self.ocr_bench_output.setText(f"❌ OCR Error: {err}")
+            future = self.executor.submit(
+                self.vision.read_thai_text,
+                image_copy,
+            )
+
+        except RuntimeError as exc:
+            self.ocr_bench_output.setPlainText(f"❌ Could not schedule OCR: {exc}")
+            return
+
+        future.add_done_callback(
+            lambda completed, rid=request_id: self._publish_ui_task_result(
+                "ocr",
+                rid,
+                "",
+                completed,
+            )
+        )
 
     def _build_config_inspector(self) -> QWidget:
         inspector = QWidget()
@@ -871,10 +1068,19 @@ class MainWindow(QMainWindow):
         return inspector
 
     @Slot(str, str, str, str)
-    def append_log(self, level: str, tag: str, message: str, serial: str) -> None:
+    def append_log(
+        self,
+        level: str,
+        tag: str,
+        message: str,
+        serial: str,
+    ) -> None:
+        """Append escaped log content to prevent HTML markup injection."""
         if self._is_shutting_down:
             return
+
         timestamp = time.strftime("%H:%M:%S")
+
         color_map = {
             "INFO": "#38bdf8",
             "WARN": "#fbbf24",
@@ -882,8 +1088,28 @@ class MainWindow(QMainWindow):
             "ADB": "#c084fc",
             "ACTION": "#a855f7",
         }
-        color = color_map.get(level, "#f1f5f9")
-        formatted = f'<span style="color:#64748b">[{timestamp}]</span> <span style="color:{color}"><b>[{level}]</b> [{tag}] ({serial}): {message}</span>'
+
+        level_text = str(level)
+        color = color_map.get(
+            level_text,
+            "#f1f5f9",
+        )
+
+        safe_timestamp = html.escape(timestamp)
+        safe_level = html.escape(level_text)
+        safe_tag = html.escape(str(tag))
+        safe_serial = html.escape(str(serial))
+        safe_message = html.escape(str(message))
+
+        formatted = (
+            f'<span style="color:#64748b">'
+            f"[{safe_timestamp}]</span> "
+            f'<span style="color:{color}">'
+            f"<b>[{safe_level}]</b> "
+            f"[{safe_tag}] ({safe_serial}): "
+            f"{safe_message}</span>"
+        )
+
         self.terminal_log.append(formatted)
 
     @Slot(str, str)
@@ -898,18 +1124,46 @@ class MainWindow(QMainWindow):
             self.worker_cards[serial].update_frame(frame, self.active_roi)
 
     def rescan_adb(self) -> None:
-        """Launches ADB scanning asynchronously to prevent main thread blocking."""
+        """Start one ADB scan without blocking the GUI."""
         if self._is_shutting_down:
             return
+
+        if self.scan_worker is not None and self.scan_worker.isRunning():
+            return
+
         self.btn_rescan.setEnabled(False)
         self.btn_rescan.setText("Scanning...")
+
         signals.log_emitted.emit(
-            "INFO", "ADB", "Scanning local ADB instances in background...", "SYSTEM"
+            "INFO",
+            "ADB",
+            "Scanning local ADB instances in background...",
+            "SYSTEM",
         )
 
         self.scan_worker = ADBScanWorker(self.adb_mgr)
+
         self.scan_worker.finished_scan.connect(self._on_scan_finished)
+
+        self.scan_worker.failed_scan.connect(self._on_scan_failed)
+
         self.scan_worker.start()
+
+    @Slot(str)
+    def _on_scan_failed(self, message: str) -> None:
+        """Restore the scan controls without deleting existing device cards."""
+        if self._is_shutting_down:
+            return
+
+        self.btn_rescan.setEnabled(True)
+        self.btn_rescan.setText("🔄 Rescan ADB")
+
+        signals.log_emitted.emit(
+            "ERROR",
+            "ADB",
+            f"Scan failed; existing instances were retained: {message}",
+            "SYSTEM",
+        )
 
     @Slot(list)
     def _on_scan_finished(self, devices: List[str]) -> None:
@@ -919,6 +1173,15 @@ class MainWindow(QMainWindow):
 
         self.btn_rescan.setEnabled(True)
         self.btn_rescan.setText("🔄 Rescan ADB")
+
+        if not devices:
+            signals.log_emitted.emit(
+                "WARN",
+                "ADB",
+                "Scan completed, but no authorized local emulator was found. "
+                "Check `adb devices -l`, the ADB executable path, and emulator ports.",
+                "SYSTEM",
+            )
 
         # Step 1: Remove cards for devices that were deduplicated or closed
         stale_serials = [s for s in list(self.workers.keys()) if s not in devices]
@@ -959,18 +1222,50 @@ class MainWindow(QMainWindow):
             self.grid_layout.addWidget(card, row, col)
 
     def start_worker(self, serial: str) -> None:
+        """Submit at most one active or pending worker execution per device."""
         if self._is_shutting_down:
             return
-        if serial in self.workers and not self.workers[serial].is_running:
-            worker = self.workers[serial]
-            try:
-                self.executor.submit(worker.run)
-            except RuntimeError:
-                pass
+
+        worker = self.workers.get(serial)
+
+        if worker is None:
+            return
+
+        existing = self.worker_futures.get(serial)
+
+        if existing is not None and not existing.done():
+            return
+
+        if not worker.prepare_start():
+            return
+
+        try:
+            future = self.executor.submit(worker.run)
+            self.worker_futures[serial] = future
+
+        except RuntimeError as exc:
+            worker.cancel_start()
+
+            signals.log_emitted.emit(
+                "ERROR",
+                "WORKER",
+                f"Could not start worker: {exc}",
+                serial,
+            )
 
     def stop_worker(self, serial: str) -> None:
-        if serial in self.workers and self.workers[serial].is_running:
-            self.workers[serial].stop()
+        """Stop an active worker or cancel its queued execution."""
+        worker = self.workers.get(serial)
+
+        if worker is None:
+            return
+
+        worker.stop()
+
+        future = self.worker_futures.get(serial)
+
+        if future is not None and not future.running():
+            future.cancel()
 
     def start_all(self) -> None:
         for serial in self.workers:
@@ -981,16 +1276,32 @@ class MainWindow(QMainWindow):
             self.stop_worker(serial)
 
     def _poll_idle_frames_async(self) -> None:
-        """Captures idle frames in background thread pool without queue flooding."""
+        """Prevent multiple outstanding idle-frame captures for one device."""
         if self._is_shutting_down:
             return
 
         for serial, worker in list(self.workers.items()):
-            if not worker.is_running:
-                try:
-                    self.executor.submit(self._capture_idle_frame_task, serial)
-                except RuntimeError:
-                    break
+            if worker.is_running:
+                continue
+
+            worker_future = self.worker_futures.get(serial)
+
+            if worker_future is not None and not worker_future.done():
+                continue
+
+            idle_future = self.idle_frame_futures.get(serial)
+
+            if idle_future is not None and not idle_future.done():
+                continue
+
+            try:
+                self.idle_frame_futures[serial] = self.executor.submit(
+                    self._capture_idle_frame_task,
+                    serial,
+                )
+
+            except RuntimeError:
+                return
 
     def _capture_idle_frame_task(self, serial: str) -> None:
         if self._is_shutting_down:
@@ -1000,29 +1311,44 @@ class MainWindow(QMainWindow):
             signals.frame_ready.emit(serial, frame)
 
     def closeEvent(self, event) -> None:
-        """Performs graceful shutdown of timers, scan threads, signal bindings, and thread pools."""
+        """Shut down timers, workers, background tasks, and signal connections."""
         self._is_shutting_down = True
 
-        try:
-            signals.log_emitted.disconnect(self.append_log)
-            signals.state_changed.disconnect(self.on_state_changed)
-            signals.frame_ready.disconnect(self.on_frame_ready)
-        except (RuntimeError, TypeError):
-            pass
+        signal_slots = (
+            (signals.log_emitted, self.append_log),
+            (signals.state_changed, self.on_state_changed),
+            (signals.frame_ready, self.on_frame_ready),
+            (signals.ui_task_finished, self._on_ui_task_finished),
+        )
+
+        for signal, slot in signal_slots:
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
 
         if hasattr(self, "idle_timer") and self.idle_timer.isActive():
             self.idle_timer.stop()
 
-        if self.scan_worker and self.scan_worker.isRunning():
-            self.scan_worker.quit()
-            self.scan_worker.wait(1000)
-
         self.stop_all()
 
-        try:
-            self.executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+        for future in self.worker_futures.values():
+            if not future.running():
+                future.cancel()
+
+        for future in self.idle_frame_futures.values():
+            if not future.running():
+                future.cancel()
+
+        # A custom QThread.run() method does not use QThread.exec().
+        # Therefore quit() cannot interrupt the scan operation.
+        if self.scan_worker is not None and self.scan_worker.isRunning():
+            self.scan_worker.wait()
+
+        self.executor.shutdown(
+            wait=True,
+            cancel_futures=True,
+        )
 
         event.accept()
 

@@ -103,104 +103,150 @@ class ADBManager:
         return None
 
     def scan_mumu_instances(self) -> List[str]:
-        """Scans local TCP ports in parallel and deduplicates duplicate alias ports mapping to the same VM."""
-        candidate_ports = self._generate_candidate_ports()
+        """Discover connected local emulators and deduplicate aliases safely.
 
-        # Step 1: Rapid parallel TCP socket probing
+        Existing ADB connections are checked before port probing, so a device
+        already connected by MuMu is not missed merely because its port is not
+        in the candidate list. ADB command failures are raised instead of being
+        converted into a misleading empty device list.
+        """
+
+        def read_connected_serials() -> List[str]:
+            result = subprocess.run(
+                [self.adb_path, "devices", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(
+                    "ADB devices query failed" + (f": {detail}" if detail else "")
+                )
+
+            discovered: List[str] = []
+            accepted_prefixes = (
+                f"{self.host}:",
+                "127.",
+                "localhost:",
+                "emulator-",
+            )
+
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) < 2 or fields[1] != "device":
+                    continue
+
+                serial = fields[0].strip()
+                if serial.startswith(accepted_prefixes) and serial not in discovered:
+                    discovered.append(serial)
+
+            return discovered
+
+        # Ensure the ADB server is available before querying its device table.
+        start_result = subprocess.run(
+            [self.adb_path, "start-server"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        if start_result.returncode != 0:
+            detail = start_result.stderr.strip() or start_result.stdout.strip()
+            raise RuntimeError(
+                "Could not start the ADB server" + (f": {detail}" if detail else "")
+            )
+
+        # Capture devices already connected by MuMu or by a previous scan.
+        connected_serials = read_connected_serials()
+
+        # Probe likely MuMu ports, then ask ADB to connect to ports that answer.
+        candidate_ports = self._generate_candidate_ports()
         open_ports: List[int] = []
+
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(32, len(candidate_ports))
+            max_workers=min(32, max(1, len(candidate_ports)))
         ) as executor:
             future_to_port = {
                 executor.submit(self._is_port_open, self.host, port): port
                 for port in candidate_ports
             }
+
             for future in concurrent.futures.as_completed(future_to_port):
-                port = future_to_port[future]
                 try:
                     if future.result():
-                        open_ports.append(port)
+                        open_ports.append(future_to_port[future])
                 except Exception:
-                    pass
+                    # A single failed socket probe must not abort discovery.
+                    continue
 
-        # Step 2: Parallel ADB connect
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, len(open_ports))
-        ) as executor:
-            futures = [
-                executor.submit(self._connect_device, f"{self.host}:{port}")
-                for port in open_ports
-            ]
-            concurrent.futures.wait(futures, timeout=3.0)
+        if open_ports:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(16, len(open_ports))
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        self._connect_device,
+                        f"{self.host}:{port}",
+                    )
+                    for port in sorted(open_ports)
+                ]
+                concurrent.futures.wait(futures)
 
-        # Step 3: Read connected devices list from ADB CLI
-        connected_serials: List[str] = []
-        try:
-            result = subprocess.run(
-                [self.adb_path, "devices"], capture_output=True, text=True, timeout=3.0
-            )
-            for line in result.stdout.splitlines():
-                if "\tdevice" in line:
-                    dev_serial = line.split("\t")[0]
-                    if dev_serial.startswith(self.host) or dev_serial.startswith(
-                        "127.0.0.1"
-                    ):
-                        if dev_serial not in connected_serials:
-                            connected_serials.append(dev_serial)
-        except (subprocess.TimeoutExpired, subprocess.SubprocessError):
-            print("[ADBManager] Error executing 'adb devices' query.")
-            return []
+        # Re-query after connection attempts and merge with the initial result.
+        for serial in read_connected_serials():
+            if serial not in connected_serials:
+                connected_serials.append(serial)
 
         if not connected_serials:
             return []
 
-        # Step 4: Extract kernel boot UUID for each connected port concurrently
+        # Resolve duplicate ADB aliases by Android boot UUID / MAC only.
+        # Hostname is not a safe identity because cloned VMs may share it.
         uuid_map: Dict[str, str] = {}
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, len(connected_serials))
+            max_workers=min(16, len(connected_serials))
         ) as executor:
             future_to_serial = {
                 executor.submit(self._get_vm_boot_uuid, serial): serial
                 for serial in connected_serials
             }
+
             for future in concurrent.futures.as_completed(future_to_serial):
                 serial = future_to_serial[future]
-                vm_uuid = future.result()
-                if vm_uuid:
+                try:
+                    vm_uuid = future.result()
+                except Exception:
+                    vm_uuid = None
+
+                if vm_uuid and not vm_uuid.startswith("host_"):
                     uuid_map[serial] = vm_uuid
 
-        # Step 5: Group serials by VM boot UUID and pick exactly ONE canonical serial per VM
         grouped_by_uuid: Dict[str, List[str]] = {}
         unmapped_serials: List[str] = []
 
         for serial in connected_serials:
-            if serial in uuid_map:
-                vm_uuid = uuid_map[serial]
+            vm_uuid = uuid_map.get(serial)
+            if vm_uuid:
                 grouped_by_uuid.setdefault(vm_uuid, []).append(serial)
             else:
                 unmapped_serials.append(serial)
 
-        unique_canonical_serials: List[str] = []
-
-        def sort_port_key(s: str) -> int:
+        def sort_port_key(serial: str) -> int:
             try:
-                return int(s.split(":")[-1])
+                return int(serial.rsplit(":", 1)[-1])
             except ValueError:
                 return 0
 
-        # For each physical VM UUID, pick the primary port (lowest port number)
-        for vm_uuid, serials in grouped_by_uuid.items():
-            serials.sort(key=sort_port_key)
-            canonical_port = serials[0]
-            unique_canonical_serials.append(canonical_port)
+        canonical_serials: List[str] = []
 
-        # Include unmapped serials only if no UUID was obtained
-        for serial in unmapped_serials:
-            if serial not in unique_canonical_serials:
-                unique_canonical_serials.append(serial)
+        for serials in grouped_by_uuid.values():
+            canonical_serials.append(min(serials, key=sort_port_key))
 
-        unique_canonical_serials.sort(key=sort_port_key)
-        return unique_canonical_serials
+        canonical_serials.extend(unmapped_serials)
+        return sorted(set(canonical_serials), key=sort_port_key)
 
     def _connect_device(self, serial: str) -> None:
         """Issues an adb connect command for a target serial."""
@@ -244,9 +290,16 @@ class ADBManager:
                 if w > 0 and h > 0:
                     expected_pixel_bytes = w * h * 4
                     header_size = len(raw_data) - expected_pixel_bytes
-                    if header_size in (12, 16) and len(raw_data) >= header_size + expected_pixel_bytes:
-                        pixel_bytes = raw_data[header_size : header_size + expected_pixel_bytes]
-                        img = np.frombuffer(pixel_bytes, dtype=np.uint8).reshape((h, w, 4))
+                    if (
+                        header_size in (12, 16)
+                        and len(raw_data) >= header_size + expected_pixel_bytes
+                    ):
+                        pixel_bytes = raw_data[
+                            header_size : header_size + expected_pixel_bytes
+                        ]
+                        img = np.frombuffer(pixel_bytes, dtype=np.uint8).reshape(
+                            (h, w, 4)
+                        )
                         return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
         except Exception:
             pass

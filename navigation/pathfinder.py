@@ -21,22 +21,32 @@ class AStarPathfinder:
         return math.hypot(a[0] - b[0], a[1] - b[1])
 
     def find_path(
-        self, start: Tuple[int, int], goal: Tuple[int, int]
+        self,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
     ) -> Optional[List[Tuple[int, int]]]:
-        """Calculates optimal path from start to goal coordinates using A* search."""
-        if not (0 <= start[0] < self.grid_w and 0 <= start[1] < self.grid_h):
+        """Find an optimal 8-direction path without diagonal corner cutting."""
+        if (
+            len(start) != 2
+            or len(goal) != 2
+            or not (
+                0 <= start[0] < self.grid_w
+                and 0 <= start[1] < self.grid_h
+            )
+            or not (
+                0 <= goal[0] < self.grid_w
+                and 0 <= goal[1] < self.grid_h
+            )
+        ):
             return None
-        if not (0 <= goal[0] < self.grid_w and 0 <= goal[1] < self.grid_h):
+
+        if (
+            self.grid[start[0]][start[1]] == 1
+            or self.grid[goal[0]][goal[1]] == 1
+        ):
             return None
 
-        open_set: List[Tuple[float, Tuple[int, int]]] = []
-        heapq.heappush(open_set, (0.0, start))
-
-        closed_set = set()
-        came_from = {}
-        g_score = {start: 0.0}
-
-        neighbors = [
+        neighbors = (
             (-1, 0),
             (1, 0),
             (0, -1),
@@ -45,40 +55,88 @@ class AStarPathfinder:
             (-1, 1),
             (1, -1),
             (1, 1),
+        )
+
+        open_set = [
+            (self._heuristic(start, goal), start)
         ]
+
+        closed_set = set()
+        came_from = {}
+        g_score = {start: 0.0}
 
         while open_set:
             _, current = heapq.heappop(open_set)
 
             if current in closed_set:
                 continue
-            closed_set.add(current)
 
             if current == goal:
-                path = []
-                curr = current
-                while curr in came_from:
-                    path.append(curr)
-                    curr = came_from[curr]
-                path.append(start)
-                return path[::-1]
+                path = [current]
+
+                while path[-1] != start:
+                    path.append(came_from[path[-1]])
+
+                path.reverse()
+                return path
+
+            closed_set.add(current)
+
+            current_x, current_y = current
 
             for dx, dy in neighbors:
-                neighbor = (current[0] + dx, current[1] + dy)
-                nx, ny = neighbor
+                nx = current_x + dx
+                ny = current_y + dy
 
-                if not (0 <= nx < self.grid_w and 0 <= ny < self.grid_h):
+                neighbor = (nx, ny)
+
+                if not (
+                    0 <= nx < self.grid_w
+                    and 0 <= ny < self.grid_h
+                ):
                     continue
-                if self.grid[nx][ny] == 1 or neighbor in closed_set:
+
+                if self.grid[nx][ny] == 1:
                     continue
 
-                step_cost = 1.414 if (dx != 0 and dy != 0) else 1.0
-                tentative_g_score = g_score[current] + step_cost
+                if neighbor in closed_set:
+                    continue
 
-                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g_score
-                    f = tentative_g_score + self._heuristic(neighbor, goal)
-                    heapq.heappush(open_set, (f, neighbor))
+                # Prevent diagonal movement through obstacle corners.
+                if dx != 0 and dy != 0:
+                    if self.grid[current_x + dx][current_y] == 1:
+                        continue
+
+                    if self.grid[current_x][current_y + dy] == 1:
+                        continue
+
+                step_cost = (
+                    math.sqrt(2.0)
+                    if dx != 0 and dy != 0
+                    else 1.0
+                )
+
+                tentative_g = (
+                    g_score[current] + step_cost
+                )
+
+                if tentative_g >= g_score.get(
+                    neighbor,
+                    math.inf,
+                ):
+                    continue
+
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+
+                estimated_total = (
+                    tentative_g
+                    + self._heuristic(neighbor, goal)
+                )
+
+                heapq.heappush(
+                    open_set,
+                    (estimated_total, neighbor),
+                )
 
         return None

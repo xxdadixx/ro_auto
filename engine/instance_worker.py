@@ -165,6 +165,10 @@ class InstanceWorker:
         self._state = BotState.INIT
         self._is_running = False
 
+        self._stop_event = threading.Event()
+        self._stop_event.set()
+        self._start_reserved = False
+
         self._active_target_template: Optional[np.ndarray] = None
         self._active_target_roi: Optional[Tuple[int, int, int, int]] = None
 
@@ -272,43 +276,108 @@ class InstanceWorker:
 
         return annotated_frame
 
-    def run(self) -> None:
-        """Main execution loop sharing captured frames directly with the UI."""
-        self.is_running = True
-        signals.log_emitted.emit(
-            "INFO",
-            "STATE",
-            "Dynamic Worker execution loop started.",
-            self.device_serial,
-        )
-
+    def prepare_start(self) -> bool:
+        """Reserve a single worker execution before executor submission."""
         with self._lock:
+            if self._is_running or self._start_reserved:
+                return False
+
+            self._stop_event.clear()
+            self._start_reserved = True
+
+            return True
+
+    def cancel_start(self) -> None:
+        """Cancel a pending start when executor submission fails."""
+        with self._lock:
+            if not self._is_running:
+                self._start_reserved = False
+                self._stop_event.set()
+
+    def run(self) -> None:
+        """Execute one guarded worker loop with cooperative cancellation."""
+        with self._lock:
+            if (
+                self._is_running
+                or not self._start_reserved
+                or self._stop_event.is_set()
+            ):
+                self._start_reserved = False
+                return
+
+            self._start_reserved = False
+            self._is_running = True
             self._state = BotState.CHECK_QUEST
+
             current_state = self._state
-        signals.state_changed.emit(self.device_serial, current_state.name)
 
-        while self.is_running:
-            try:
-                frame = self.adb.capture_frame(self.device_serial)
-                if frame is None:
-                    time.sleep(1.0)
-                    continue
+        try:
+            signals.log_emitted.emit(
+                "INFO",
+                "STATE",
+                "Dynamic Worker execution loop started.",
+                self.device_serial,
+            )
 
-                self._process_state(frame)
+            signals.state_changed.emit(
+                self.device_serial,
+                current_state.name,
+            )
 
-                annotated_frame = self._apply_visual_overlays(frame)
-                signals.frame_ready.emit(self.device_serial, annotated_frame)
-            except Exception as err:
-                signals.log_emitted.emit(
-                    "ERROR", "WORKER", f"Error in loop: {err}", self.device_serial
-                )
+            while not self._stop_event.is_set():
+                try:
+                    frame = self.adb.capture_frame(self.device_serial)
 
-            time.sleep(self.config.loop_delay_sec)
+                    if frame is None:
+                        self._stop_event.wait(1.0)
+                        continue
+
+                    self._process_state(frame)
+
+                    if self._stop_event.is_set():
+                        break
+
+                    annotated_frame = self._apply_visual_overlays(frame)
+
+                    signals.frame_ready.emit(
+                        self.device_serial,
+                        annotated_frame,
+                    )
+
+                except Exception as err:
+                    signals.log_emitted.emit(
+                        "ERROR",
+                        "WORKER",
+                        f"Error in loop: {err}",
+                        self.device_serial,
+                    )
+
+                self._stop_event.wait(max(0.0, float(self.config.loop_delay_sec)))
+
+        finally:
+            with self._lock:
+                self._is_running = False
+                self._start_reserved = False
+                self._state = BotState.INIT
+
+            signals.state_changed.emit(
+                self.device_serial,
+                "STOPPED",
+            )
 
     def stop(self) -> None:
-        """Signals the worker loop to terminate gracefully."""
-        self.is_running = False
-        signals.state_changed.emit(self.device_serial, "STOPPED")
+        """Request graceful shutdown or cancel a worker that has not started."""
+        with self._lock:
+            self._stop_event.set()
+            self._start_reserved = False
+
+            is_running = self._is_running
+
+        if not is_running:
+            signals.state_changed.emit(
+                self.device_serial,
+                "STOPPED",
+            )
 
     def _process_state(self, frame: np.ndarray) -> None:
         """Executes dynamic text anchor discovery and state progression without hardcoded pixel reliance."""

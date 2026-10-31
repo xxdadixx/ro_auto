@@ -46,51 +46,225 @@ class VisionEngine:
         roi: Optional[Tuple[int, int, int, int]] = None,
         min_confidence: float = 0.35,
     ) -> Optional[Tuple[Tuple[int, int], str]]:
-        """Dynamically locates text keywords on screen using OCR and returns exact bounding-box centroid coordinates."""
-        if frame is None or frame.size == 0 or not keywords:
+        """Locate a keyword using EasyOCR and return its center in frame coordinates."""
+        if (
+            frame is None
+            or not isinstance(frame, np.ndarray)
+            or frame.size == 0
+        ):
+            return None
+
+        if not 0.0 <= min_confidence <= 1.0:
+            raise ValueError("min_confidence must be between 0.0 and 1.0")
+
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.ndim == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        elif frame.ndim != 3 or frame.shape[2] != 3:
             return None
 
         target_img = frame
-        offset_x, offset_y = 0, 0
-        if roi:
-            x, y, w, h = roi
-            fh, fw = frame.shape[:2]
-            if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
+        offset_x = 0
+        offset_y = 0
+
+        if roi is not None:
+            if len(roi) != 4:
+                raise ValueError("roi must contain x, y, width, height")
+
+            x, y, width, height = map(int, roi)
+            frame_h, frame_w = frame.shape[:2]
+
+            if (
+                x < 0
+                or y < 0
+                or width <= 0
+                or height <= 0
+                or x + width > frame_w
+                or y + height > frame_h
+            ):
                 return None
-            target_img = frame[y : y + h, x : x + w]
-            offset_x, offset_y = x, y
+
+            target_img = frame[y:y + height, x:x + width]
+            offset_x = x
+            offset_y = y
+
+        normalized_keywords = [
+            str(keyword).casefold()
+            for keyword in keywords
+            if str(keyword).strip()
+        ]
+
+        if not normalized_keywords:
+            return None
 
         processed_img = self.preprocess_for_ocr(target_img)
 
-        with self._ocr_lock:
-            try:
-                ocr_results = self.reader.readtext(
+        if processed_img is None or processed_img.size == 0:
+            return None
+
+        # Resolve the lazy-loaded reader before acquiring the inference lock.
+        # The reader property also acquires _ocr_lock during initialization.
+        try:
+            reader = self.reader
+
+            with self._ocr_lock:
+                ocr_results = reader.readtext(
                     processed_img,
                     paragraph=False,
                     detail=1,
                     contrast_ths=0.1,
                     adjust_contrast=0.5,
                 )
-                for bbox, text, prob in ocr_results:
-                    if prob < min_confidence:
-                        continue
-                    cleaned = text.strip()
-                    for kw in keywords:
-                        if kw.lower() in cleaned.lower():
-                            # Calculate bounding box centroid inside upscaled image
-                            pts = np.array(bbox, dtype=np.float32)
-                            # Bounding box is extracted from 2.5x upscaled processed_img
-                            cx_upscaled = float(np.mean(pts[:, 0]))
-                            cy_upscaled = float(np.mean(pts[:, 1]))
 
-                            # Convert coordinates back to original frame space
-                            real_cx = int(cx_upscaled / 2.5) + offset_x
-                            real_cy = int(cy_upscaled / 2.5) + offset_y
-                            return ((real_cx, real_cy), cleaned)
-            except Exception:
-                pass
+        except Exception as exc:
+            raise RuntimeError(
+                "EasyOCR failed while locating a text anchor"
+            ) from exc
+
+        # Calculate the actual preprocessing scale rather than assuming
+        # that both image dimensions always use an identical scale factor.
+        scale_x = processed_img.shape[1] / target_img.shape[1]
+        scale_y = processed_img.shape[0] / target_img.shape[0]
+
+        if scale_x <= 0 or scale_y <= 0:
+            return None
+
+        for result in ocr_results:
+            if not isinstance(result, (tuple, list)) or len(result) != 3:
+                continue
+
+            bbox, recognized_text, probability = result
+
+            cleaned = str(recognized_text).strip()
+
+            try:
+                confidence = float(probability)
+                points = np.asarray(bbox, dtype=np.float32)
+            except (TypeError, ValueError):
+                continue
+
+            if (
+                not np.isfinite(confidence)
+                or confidence < min_confidence
+                or not cleaned
+            ):
+                continue
+
+            if not any(
+                keyword in cleaned.casefold()
+                for keyword in normalized_keywords
+            ):
+                continue
+
+            if (
+                points.ndim != 2
+                or points.shape[0] == 0
+                or points.shape[1] < 2
+                or not np.all(np.isfinite(points))
+            ):
+                continue
+
+            center_x = int(
+                round(float(points[:, 0].mean()) / scale_x)
+            ) + offset_x
+
+            center_y = int(
+                round(float(points[:, 1].mean()) / scale_y)
+            ) + offset_y
+
+            return (center_x, center_y), cleaned
 
         return None
+
+    def read_thai_text(
+        self,
+        frame: np.ndarray,
+        roi: Optional[Tuple[int, int, int, int]] = None,
+        min_confidence: float = 0.0,
+    ) -> List[str]:
+        """Recognize Thai and English text in a frame or a selected ROI."""
+        if (
+            frame is None
+            or not isinstance(frame, np.ndarray)
+            or frame.size == 0
+        ):
+            return []
+
+        if not 0.0 <= min_confidence <= 1.0:
+            raise ValueError("min_confidence must be between 0.0 and 1.0")
+
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.ndim == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        elif frame.ndim != 3 or frame.shape[2] != 3:
+            return []
+
+        target_img = frame
+
+        if roi is not None:
+            if len(roi) != 4:
+                raise ValueError("roi must contain x, y, width, height")
+
+            x, y, width, height = map(int, roi)
+            frame_h, frame_w = frame.shape[:2]
+
+            if (
+                x < 0
+                or y < 0
+                or width <= 0
+                or height <= 0
+                or x + width > frame_w
+                or y + height > frame_h
+            ):
+                return []
+
+            target_img = frame[y:y + height, x:x + width]
+
+        processed_img = self.preprocess_for_ocr(target_img)
+
+        if processed_img is None or processed_img.size == 0:
+            return []
+
+        try:
+            reader = self.reader
+
+            with self._ocr_lock:
+                ocr_results = reader.readtext(
+                    processed_img,
+                    paragraph=False,
+                    detail=1,
+                    contrast_ths=0.1,
+                    adjust_contrast=0.5,
+                )
+
+        except Exception as exc:
+            raise RuntimeError(
+                "EasyOCR failed while reading text"
+            ) from exc
+
+        recognized: List[str] = []
+
+        for result in ocr_results:
+            if not isinstance(result, (tuple, list)) or len(result) != 3:
+                continue
+
+            text = str(result[1]).strip()
+
+            try:
+                confidence = float(result[2])
+            except (TypeError, ValueError):
+                continue
+
+            if (
+                text
+                and np.isfinite(confidence)
+                and confidence >= min_confidence
+            ):
+                recognized.append(text)
+
+        return recognized
 
     def match_template_multiscale(
         self,

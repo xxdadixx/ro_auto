@@ -17,6 +17,9 @@ class AppSignals(QObject):
     # Signal payload: list_of_discovered_serials
     instances_scanned = Signal(list)
 
+    # Signal payload: (operation, request_id, serial, result, error_message)
+    ui_task_finished = Signal(str, int, str, object, str)
+
 
 # Shared Global Signal Dispatcher
 signals = AppSignals()
