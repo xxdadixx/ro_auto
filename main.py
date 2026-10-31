@@ -129,6 +129,77 @@ def draw_roi_overlay(
     return frame_copy
 
 
+def draw_tap_indicator(
+    frame: np.ndarray,
+    x: int,
+    y: int,
+    label: str = "TAP",
+    color: Tuple[int, int, int] = (0, 242, 254),  # Electric Cyan BGR
+) -> np.ndarray:
+    """Draws a high-visibility target crosshair and coordinate badge overlay on the frame matrix."""
+    if frame is None or frame.size == 0:
+        return frame
+
+    fh, fw = frame.shape[:2]
+    if not (0 <= x < fw and 0 <= y < fh):
+        return frame
+
+    frame_copy = frame.copy()
+
+    # Target concentric circles
+    cv2.circle(frame_copy, (x, y), 18, color, 2, cv2.LINE_AA)
+    cv2.circle(
+        frame_copy, (x, y), 6, (0, 0, 255), -1, cv2.LINE_AA
+    )  # Red inner center dot
+    cv2.circle(frame_copy, (x, y), 2, (255, 255, 255), -1, cv2.LINE_AA)
+
+    # Crosshair reticle lines
+    cv2.line(frame_copy, (x - 25, y), (x - 8, y), color, 2, cv2.LINE_AA)
+    cv2.line(frame_copy, (x + 8, y), (x + 25, y), color, 2, cv2.LINE_AA)
+    cv2.line(frame_copy, (x, y - 25), (x, y - 8), color, 2, cv2.LINE_AA)
+    cv2.line(frame_copy, (x, y + 8), (x, y + 25), color, 2, cv2.LINE_AA)
+
+    # Coordinate badge text box
+    badge_text = f" 🎯 {label} [{x}, {y}] "
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    thickness = 1
+    (text_w, text_h), baseline = cv2.getTextSize(
+        badge_text, font, font_scale, thickness
+    )
+
+    label_x = max(0, min(x + 20, fw - text_w - 5))
+    label_y = max(text_h + 5, min(y - 10, fh - 5))
+
+    # Dark background badge rectangle
+    cv2.rectangle(
+        frame_copy,
+        (label_x, label_y - text_h - 4),
+        (label_x + text_w, label_y + baseline),
+        (15, 21, 37),
+        -1,
+    )
+    cv2.rectangle(
+        frame_copy,
+        (label_x, label_y - text_h - 4),
+        (label_x + text_w, label_y + baseline),
+        color,
+        1,
+    )
+    cv2.putText(
+        frame_copy,
+        badge_text,
+        (label_x, label_y),
+        font,
+        font_scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    return frame_copy
+
+
 class InteractiveCropCanvas(QLabel):
     """Interactive Qt Label widget enabling mouse drag-to-crop ROI selection with persistent overlay memory."""
 
@@ -224,8 +295,11 @@ class InteractiveCropCanvas(QLabel):
             pm_w, pm_h = pm.width(), pm.height()
             lbl_w, lbl_h = self.width(), self.height()
 
-            offset_x = (lbl_w - pm_w) // 2
-            offset_y = (lbl_h - pm_h) // 2
+            if pm_w <= 0 or pm_h <= 0:
+                return
+
+            offset_x = max(0, (lbl_w - pm_w) // 2)
+            offset_y = max(0, (lbl_h - pm_h) // 2)
 
             adj_x1 = max(0, min(rect.left() - offset_x, pm_w))
             adj_y1 = max(0, min(rect.top() - offset_y, pm_h))
@@ -242,10 +316,10 @@ class InteractiveCropCanvas(QLabel):
             scale_x = orig_w / float(pm_w)
             scale_y = orig_h / float(pm_h)
 
-            real_x = int(adj_x1 * scale_x)
-            real_y = int(adj_y1 * scale_y)
-            real_w = int(crop_w * scale_x)
-            real_h = int(crop_h * scale_y)
+            real_x = min(int(adj_x1 * scale_x), orig_w - 1)
+            real_y = min(int(adj_y1 * scale_y), orig_h - 1)
+            real_w = max(1, min(int(crop_w * scale_x), orig_w - real_x))
+            real_h = max(1, min(int(crop_h * scale_y), orig_h - real_y))
 
             self._cropped_frame = self._current_frame[
                 real_y : real_y + real_h, real_x : real_x + real_w
@@ -257,12 +331,13 @@ class InteractiveCropCanvas(QLabel):
 
 
 class InstanceCardWidget(QFrame):
-    """Native widget card representing a single emulator instance with live ROI overlay support."""
+    """Native widget card representing a single emulator instance with click-to-tap visual feed testing."""
 
     def __init__(self, serial: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.serial = serial
         self._is_running = False
+        self._last_raw_frame_size: Optional[Tuple[int, int]] = None
         self.setObjectName("glassPanel")
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.setFixedWidth(344)
@@ -303,6 +378,7 @@ class InstanceCardWidget(QFrame):
         self.canvas.setStyleSheet(
             "background-color: #06090f; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px;"
         )
+        self.canvas.mousePressEvent = self._on_canvas_clicked
         layout.addWidget(self.canvas)
 
         # Controls Row
@@ -310,6 +386,44 @@ class InstanceCardWidget(QFrame):
         self.btn_toggle.setFixedHeight(32)
         self.btn_toggle.clicked.connect(self._on_toggle)
         layout.addWidget(self.btn_toggle)
+
+    def _on_canvas_clicked(self, event) -> None:
+        """Handles direct mouse clicks on preview cards to execute test taps and display visual overlays."""
+        if event.button() != Qt.LeftButton or not self._last_raw_frame_size:
+            return
+
+        pm = self.canvas.pixmap()
+        if not pm or pm.isNull():
+            return
+
+        click_pos = event.pos()
+        lbl_w, lbl_h = self.canvas.width(), self.canvas.height()
+        pm_w, pm_h = pm.width(), pm.height()
+
+        offset_x = (lbl_w - pm_w) // 2
+        offset_y = (lbl_h - pm_h) // 2
+
+        rel_x = click_pos.x() - offset_x
+        rel_y = click_pos.y() - offset_y
+
+        if 0 <= rel_x < pm_w and 0 <= rel_y < pm_h:
+            orig_w, orig_h = self._last_raw_frame_size
+            scale_x = orig_w / float(pm_w)
+            scale_y = orig_h / float(pm_h)
+
+            real_x = int(rel_x * scale_x)
+            real_y = int(rel_y * scale_y)
+
+            window = self.window()
+            if hasattr(window, "workers") and self.serial in window.workers:
+                worker = window.workers[self.serial]
+                worker.register_tap(real_x, real_y, label="MANUAL TEST TAP")
+                signals.log_emitted.emit(
+                    "INFO",
+                    "ACTION",
+                    f"👈 Manual test tap fired at [{real_x}, {real_y}]. Overlay updated.",
+                    self.serial,
+                )
 
     def update_frame(
         self,
@@ -319,6 +433,8 @@ class InstanceCardWidget(QFrame):
         """Renders live instance frame with remembered ROI bounding box overlay."""
         if frame is None or frame.size == 0:
             return
+
+        self._last_raw_frame_size = (frame.shape[1], frame.shape[0])
 
         display_frame = frame
         if active_roi is not None:

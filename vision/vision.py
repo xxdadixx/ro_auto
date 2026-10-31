@@ -1,5 +1,4 @@
 import os
-import re
 import threading
 from typing import Dict, List, Optional, Tuple
 import cv2
@@ -17,7 +16,7 @@ from config import VisionConfig
 
 
 class VisionEngine:
-    """High-precision computer vision and Thai EasyOCR/Tesseract engine with sentence reconstruction."""
+    """High-precision dynamic computer vision engine featuring OCR text anchor extraction and multi-scale template matching."""
 
     def __init__(
         self, use_gpu: bool = False, config: VisionConfig = VisionConfig()
@@ -31,112 +30,88 @@ class VisionEngine:
 
     @property
     def reader(self) -> easyocr.Reader:
-        """Instantiates EasyOCR/PyTorch lazily on demand."""
+        """Instantiates EasyOCR/PyTorch lazily on demand with thread-safe double-checked locking."""
         if self._reader is None:
-            self._reader = easyocr.Reader(
-                list(self.config.ocr_languages), gpu=self.use_gpu
-            )
+            with self._ocr_lock:
+                if self._reader is None:
+                    self._reader = easyocr.Reader(
+                        list(self.config.ocr_languages), gpu=self.use_gpu
+                    )
         return self._reader
 
-    def _get_template(self, template_path: str) -> Optional[np.ndarray]:
-        """Loads and caches template images with thread safety."""
-        with self._cache_lock:
-            if template_path not in self._template_cache:
-                if not os.path.exists(template_path):
-                    return None
-                template = cv2.imread(template_path, cv2.IMREAD_COLOR)
-                if template is None:
-                    return None
-                self._template_cache[template_path] = template
-            return self._template_cache[template_path]
-
-    def match_template(
+    def find_text_anchor(
         self,
         frame: np.ndarray,
-        template_path: str,
-        threshold: Optional[float] = None,
+        keywords: List[str],
         roi: Optional[Tuple[int, int, int, int]] = None,
-    ) -> Optional[Tuple[int, int]]:
-        """Finds center coordinates of a target image template within a frame."""
-        if frame is None or frame.size == 0:
+        min_confidence: float = 0.35,
+    ) -> Optional[Tuple[Tuple[int, int], str]]:
+        """Dynamically locates text keywords on screen using OCR and returns exact bounding-box centroid coordinates."""
+        if frame is None or frame.size == 0 or not keywords:
             return None
 
-        template = self._get_template(template_path)
-        if template is None:
-            return None
-
-        effective_threshold = (
-            threshold
-            if threshold is not None
-            else self.config.template_matching_threshold
-        )
-        target_frame = frame
+        target_img = frame
         offset_x, offset_y = 0, 0
-
         if roi:
             x, y, w, h = roi
             fh, fw = frame.shape[:2]
             if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
                 return None
-            target_frame = frame[y : y + h, x : x + w]
+            target_img = frame[y : y + h, x : x + w]
             offset_x, offset_y = x, y
 
-        if (
-            target_frame.shape[0] < template.shape[0]
-            or target_frame.shape[1] < template.shape[1]
-        ):
-            return None
+        processed_img = self.preprocess_for_ocr(target_img)
 
-        result = cv2.matchTemplate(target_frame, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        with self._ocr_lock:
+            try:
+                ocr_results = self.reader.readtext(
+                    processed_img,
+                    paragraph=False,
+                    detail=1,
+                    contrast_ths=0.1,
+                    adjust_contrast=0.5,
+                )
+                for bbox, text, prob in ocr_results:
+                    if prob < min_confidence:
+                        continue
+                    cleaned = text.strip()
+                    for kw in keywords:
+                        if kw.lower() in cleaned.lower():
+                            # Calculate bounding box centroid inside upscaled image
+                            pts = np.array(bbox, dtype=np.float32)
+                            # Bounding box is extracted from 2.5x upscaled processed_img
+                            cx_upscaled = float(np.mean(pts[:, 0]))
+                            cy_upscaled = float(np.mean(pts[:, 1]))
 
-        if max_val >= effective_threshold:
-            t_h, t_w, _ = template.shape
-            center_x = max_loc[0] + (t_w // 2) + offset_x
-            center_y = max_loc[1] + (t_h // 2) + offset_y
-            return (center_x, center_y)
+                            # Convert coordinates back to original frame space
+                            real_cx = int(cx_upscaled / 2.5) + offset_x
+                            real_cy = int(cy_upscaled / 2.5) + offset_y
+                            return ((real_cx, real_cy), cleaned)
+            except Exception:
+                pass
 
         return None
 
-    def preprocess_for_ocr(self, img: np.ndarray) -> np.ndarray:
-        """Upscales crop 2.5x and applies non-destructive CLAHE enhancement without ruining Thai glyphs."""
-        h, w = img.shape[:2]
-
-        # 1. Bicubic Upscaling 2.5x to preserve fine stroke structures for tone marks
-        upscaled = cv2.resize(
-            img, (int(w * 2.5), int(h * 2.5)), interpolation=cv2.INTER_CUBIC
-        )
-
-        # 2. Convert to Grayscale
-        gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
-
-        # 3. Apply CLAHE contrast enhancement (preserves upper/lower Thai glyph tones)
-        clahe = cv2.createCLAHE(
-            clipLimit=self.config.clahe_clip_limit,
-            tileGridSize=self.config.clahe_grid_size,
-        )
-        enhanced = clahe.apply(gray)
-        return enhanced
-
-    def match_template_matrix(
+    def match_template_multiscale(
         self,
         frame: np.ndarray,
         template: np.ndarray,
-        threshold: Optional[float] = None,
+        threshold: float = 0.70,
         roi: Optional[Tuple[int, int, int, int]] = None,
+        scales: Tuple[float, ...] = (0.75, 0.88, 1.0, 1.15, 1.30),
     ) -> Optional[Tuple[int, int]]:
-        """Finds center coordinates of an in-memory template matrix within a target frame."""
+        """Finds center coordinates of an in-memory template matrix using scale-invariant pyramid matching."""
         if frame is None or frame.size == 0 or template is None or template.size == 0:
             return None
 
-        effective_threshold = (
-            threshold
-            if threshold is not None
-            else self.config.template_matching_threshold
-        )
+        # Normalize channels to 3-channel BGR
+        if len(frame.shape) == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        if len(template.shape) == 3 and template.shape[2] == 4:
+            template = cv2.cvtColor(template, cv2.COLOR_BGRA2BGR)
+
         target_frame = frame
         offset_x, offset_y = 0, 0
-
         if roi:
             x, y, w, h = roi
             fh, fw = frame.shape[:2]
@@ -145,93 +120,99 @@ class VisionEngine:
             target_frame = frame[y : y + h, x : x + w]
             offset_x, offset_y = x, y
 
-        if (
-            target_frame.shape[0] < template.shape[0]
-            or target_frame.shape[1] < template.shape[1]
-        ):
-            return None
+        best_max_val = -1.0
+        best_center = None
 
-        result = cv2.matchTemplate(target_frame, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        t_h_orig, t_w_orig = template.shape[:2]
 
-        if max_val >= effective_threshold:
-            t_h, t_w = template.shape[:2]
-            center_x = max_loc[0] + (t_w // 2) + offset_x
-            center_y = max_loc[1] + (t_h // 2) + offset_y
-            return (center_x, center_y)
+        for scale in scales:
+            sw = int(t_w_orig * scale)
+            sh = int(t_h_orig * scale)
 
-        return None
+            if (
+                sw <= 0
+                or sh <= 0
+                or target_frame.shape[0] < sh
+                or target_frame.shape[1] < sw
+            ):
+                continue
 
-    def read_thai_text(
+            resized_template = cv2.resize(
+                template, (sw, sh), interpolation=cv2.INTER_AREA
+            )
+
+            try:
+                result = cv2.matchTemplate(
+                    target_frame, resized_template, cv2.TM_CCOEFF_NORMED
+                )
+                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+                if max_val > best_max_val and max_val >= threshold:
+                    best_max_val = max_val
+                    center_x = max_loc[0] + (sw // 2) + offset_x
+                    center_y = max_loc[1] + (sh // 2) + offset_y
+                    best_center = (center_x, center_y)
+            except cv2.Error:
+                continue
+
+        return best_center
+
+    def detect_cutscene_skip_button(
         self,
         frame: np.ndarray,
         roi: Optional[Tuple[int, int, int, int]] = None,
-        paragraph: bool = True,
-    ) -> List[str]:
-        """Extracts complete Thai sentences from image regions using dual-pass EasyOCR and PyTesseract."""
+    ) -> bool:
+        """Strict visual recognition for top-right cutscene skip button using structural feature analysis."""
         if frame is None or frame.size == 0:
-            return []
+            return False
 
         target_img = frame
         if roi:
             x, y, w, h = roi
             fh, fw = frame.shape[:2]
             if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
-                return []
+                return False
             target_img = frame[y : y + h, x : x + w]
 
-        processed_img = self.preprocess_for_ocr(target_img)
+        gray = cv2.cvtColor(target_img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(target_img, cv2.COLOR_BGR2HSV)
 
-        results_list: List[str] = []
+        lower_green = np.array([35, 140, 140])
+        upper_green = np.array([85, 255, 255])
+        green_mask = cv2.inRange(hsv, lower_green, upper_green)
 
-        # Pass 1: EasyOCR with Paragraph Sentence Reconstruction
-        with self._ocr_lock:
-            try:
-                ocr_results = self.reader.readtext(
-                    processed_img,
-                    paragraph=paragraph,
-                    detail=0,
-                    contrast_ths=0.1,
-                    adjust_contrast=0.5,
-                )
-                for text in ocr_results:
-                    cleaned = text.strip()
-                    if cleaned:
-                        results_list.append(cleaned)
-            except Exception:
-                pass
+        contours, _ = cv2.findContours(
+            green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
-        if results_list:
-            return results_list
+        for c in contours:
+            area = cv2.contourArea(c)
+            if 60 <= area <= 1500:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                aspect_ratio = float(bw) / float(bh)
+                if 0.7 <= aspect_ratio <= 1.4:
+                    green_crop_gray = gray[by : by + bh, bx : bx + bw]
+                    if green_crop_gray.size > 0:
+                        _, white_mask = cv2.threshold(
+                            green_crop_gray, 200, 255, cv2.THRESH_BINARY
+                        )
+                        white_pixels = cv2.countNonZero(white_mask)
+                        white_ratio = white_pixels / float(bw * bh)
 
-        # Pass 2: Fallback to Raw Image EasyOCR without preprocessing
-        with self._ocr_lock:
-            try:
-                raw_results = self.reader.readtext(
-                    target_img, paragraph=paragraph, detail=0
-                )
-                for text in raw_results:
-                    cleaned = text.strip()
-                    if cleaned:
-                        results_list.append(cleaned)
-            except Exception:
-                pass
+                        if 0.12 <= white_ratio <= 0.55:
+                            return True
 
-        if results_list:
-            return results_list
+        return False
 
-        # Pass 3: Tesseract Fallback (if installed)
-        if HAS_PYTESSERACT:
-            try:
-                tess_text = pytesseract.image_to_string(
-                    processed_img, lang="tha+eng", config="--psm 6"
-                )
-                lines = [
-                    line.strip() for line in tess_text.splitlines() if line.strip()
-                ]
-                if lines:
-                    return lines
-            except Exception:
-                pass
-
-        return []
+    def preprocess_for_ocr(self, img: np.ndarray) -> np.ndarray:
+        """Upscales crop 2.5x and applies CLAHE enhancement without ruining Thai glyphs."""
+        h, w = img.shape[:2]
+        upscaled = cv2.resize(
+            img, (int(w * 2.5), int(h * 2.5)), interpolation=cv2.INTER_CUBIC
+        )
+        gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(
+            clipLimit=self.config.clahe_clip_limit,
+            tileGridSize=self.config.clahe_grid_size,
+        )
+        return clahe.apply(gray)

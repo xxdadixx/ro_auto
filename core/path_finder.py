@@ -3,8 +3,14 @@ import os
 import shutil
 import string
 import subprocess
-import winreg
+import sys
 from typing import Optional
+
+# Platform-safe Windows Registry import guard
+if sys.platform == "win32":
+    import winreg
+else:
+    winreg = None
 
 
 class MuMuPathFinder:
@@ -13,27 +19,22 @@ class MuMuPathFinder:
     @classmethod
     def auto_detect_adb(cls) -> str:
         """Executes a 5-tier resolution pipeline to locate adb.exe automatically."""
-        # Tier 0: Explicit environment variable check
         env_adb = os.environ.get("ADB_PATH")
         if env_adb and os.path.exists(env_adb):
             return env_adb
 
-        # Tier 1: Running process detection
         adb_path = cls._find_from_running_processes()
         if adb_path:
             return adb_path
 
-        # Tier 2: System PATH check
         system_adb = shutil.which("adb")
         if system_adb:
             return system_adb
 
-        # Tier 3: Registry lookup
         adb_path = cls._find_from_registry()
         if adb_path:
             return adb_path
 
-        # Tier 4: Comprehensive drive scan
         adb_path = cls._find_from_drive_scan()
         if adb_path:
             return adb_path
@@ -46,19 +47,25 @@ class MuMuPathFinder:
 
     @classmethod
     def _find_from_running_processes(cls) -> Optional[str]:
-        """Detects ADB path from active emulator process locations via PowerShell."""
+        """Detects ADB path from active emulator process locations via platform commands."""
+        if sys.platform != "win32":
+            return None
+
         try:
             cmd = [
                 "powershell",
+                "-NoProfile",
+                "-NonInteractive",
                 "-Command",
                 "Get-Process -Name 'MuMuPlayer', 'NemuPlayer', 'MuMuVMMHeadless' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path",
             ]
-            output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+            output = subprocess.check_output(
+                cmd, text=True, stderr=subprocess.DEVNULL, timeout=3.0
+            )
             for line in output.splitlines():
                 line = line.strip()
                 if line and os.path.exists(line):
                     mumu_dir = os.path.dirname(line)
-                    # Check direct directory and common MuMu 12 subdirectories
                     for candidate in [
                         os.path.join(mumu_dir, "adb.exe"),
                         os.path.join(mumu_dir, "shell", "adb.exe"),
@@ -73,6 +80,9 @@ class MuMuPathFinder:
 
     @classmethod
     def _find_from_registry(cls) -> Optional[str]:
+        if winreg is None or sys.platform != "win32":
+            return None
+
         registry_keys = [
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\NetEase\MuMuPlayer"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\NetEase\MuMuPlayerGlobal"),
@@ -102,29 +112,6 @@ class MuMuPathFinder:
                     for candidate in candidates:
                         if os.path.exists(candidate):
                             return candidate
-            except OSError:
+            except (OSError, AttributeError):
                 continue
-        return None
-
-    @classmethod
-    def _find_from_drive_scan(cls) -> Optional[str]:
-        """Scans all active fixed Windows drives for standard MuMuPlayer ADB paths."""
-        drives = [
-            f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")
-        ]
-        scan_patterns = [
-            r"Program Files*\NetEase\MuMuPlayer*\shell\adb.exe",
-            r"Program Files*\NetEase\MuMuPlayer*\adb.exe",
-            r"NetEase\MuMuPlayer*\shell\adb.exe",
-            r"NetEase\MuMuPlayer*\adb.exe",
-            r"MuMuPlayer*\shell\adb.exe",
-            r"MuMu*\shell\adb.exe",
-            r"Nemu*\vms\bin\adb.exe",
-        ]
-
-        for drive in drives:
-            for pattern in scan_patterns:
-                matches = glob.glob(os.path.join(drive, pattern))
-                if matches and os.path.exists(matches[0]):
-                    return matches[0]
         return None

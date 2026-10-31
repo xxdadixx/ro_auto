@@ -224,24 +224,30 @@ class ADBManager:
             return False
 
     def capture_frame(self, device_serial: str) -> Optional[np.ndarray]:
-        """Captures frame from ADB stdout stream using fast raw RGBA parsing with PNG fallback."""
+        """Captures frame from ADB stdout stream using fast raw RGBA parsing with process lifetime safety and PNG fallback."""
         cmd_raw = [self.adb_path, "-s", device_serial, "exec-out", "screencap"]
         try:
             process = subprocess.Popen(
                 cmd_raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            raw_data, _ = process.communicate(timeout=2.0)
+            try:
+                raw_data, _ = process.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raw_data = b""
+
             if process.returncode == 0 and len(raw_data) > 16:
                 w = int.from_bytes(raw_data[0:4], byteorder="little")
                 h = int.from_bytes(raw_data[4:8], byteorder="little")
 
-                expected_size = w * h * 4
-                header_size = 12 if len(raw_data) == 12 + expected_size else 16
-
-                if len(raw_data) >= header_size + expected_size and w > 0 and h > 0:
-                    pixel_bytes = raw_data[header_size : header_size + expected_size]
-                    img = np.frombuffer(pixel_bytes, dtype=np.uint8).reshape((h, w, 4))
-                    return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+                if w > 0 and h > 0:
+                    expected_pixel_bytes = w * h * 4
+                    header_size = len(raw_data) - expected_pixel_bytes
+                    if header_size in (12, 16) and len(raw_data) >= header_size + expected_pixel_bytes:
+                        pixel_bytes = raw_data[header_size : header_size + expected_pixel_bytes]
+                        img = np.frombuffer(pixel_bytes, dtype=np.uint8).reshape((h, w, 4))
+                        return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
         except Exception:
             pass
 
@@ -250,7 +256,13 @@ class ADBManager:
             process = subprocess.Popen(
                 cmd_png, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            raw_png, _ = process.communicate(timeout=2.0)
+            try:
+                raw_png, _ = process.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                return None
+
             if process.returncode != 0 or not raw_png:
                 return None
 
