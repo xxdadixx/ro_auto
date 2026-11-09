@@ -24,23 +24,43 @@ class ADBManager:
         print(f"[ADBManager] Using ADB binary at: {self.adb_path}")
 
     def _generate_candidate_ports(self) -> List[int]:
-        """Generates candidate TCP ports considering MuMuPlayer 12 32-port stride allocation."""
-        ports: Set[int] = set()
+        """Generates candidate TCP ports considering classic and MuMuPlayer 12 dynamic allocations."""
+        ports: Set[int] = {
+            self.config.default_port,  # 7555
+            5555,
+            5557,
+            5559,
+            22471,
+        }
 
-        # Standard Emulator Ports
-        ports.add(self.config.default_port)  # 7555
-        ports.add(5555)
-        ports.add(22471)
-
-        # MuMu 12 Stride Ports
+        # Scan MuMu 12 stride range (16384 + i * 32)
         for i in range(self.config.max_instances):
             ports.add(self.config.start_port + (i * self.config.port_stride))
 
-        # Continuous Fallback Range
-        for p in range(self.config.start_port, self.config.start_port + 32):
+        # Additional fallback sweep range
+        for p in range(16384, 16384 + 128):
             ports.add(p)
 
         return sorted(list(ports))
+
+    def force_adb_recovery(self) -> bool:
+        """Restarts local ADB server to resolve hung processes or daemon version conflicts."""
+        try:
+            subprocess.run(
+                [self.adb_path, "kill-server"],
+                capture_output=True,
+                timeout=3.0,
+                check=False,
+            )
+            res = subprocess.run(
+                [self.adb_path, "start-server"],
+                capture_output=True,
+                timeout=5.0,
+                check=False,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
 
     def _get_vm_boot_uuid(self, serial: str) -> Optional[str]:
         """Queries kernel boot_id UUID to uniquely identify distinct Android VM instances."""
@@ -270,8 +290,9 @@ class ADBManager:
             return False
 
     def capture_frame(self, device_serial: str) -> Optional[np.ndarray]:
-        """Captures frame from ADB stdout stream using fast raw RGBA parsing with process lifetime safety and PNG fallback."""
+        """Captures frame from ADB stdout stream using fast raw RGBA parsing with memory safeguards and process lifetime cleanup."""
         cmd_raw = [self.adb_path, "-s", device_serial, "exec-out", "screencap"]
+        process = None
         try:
             process = subprocess.Popen(
                 cmd_raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -287,11 +308,12 @@ class ADBManager:
                 w = int.from_bytes(raw_data[0:4], byteorder="little")
                 h = int.from_bytes(raw_data[4:8], byteorder="little")
 
-                if w > 0 and h > 0:
+                # Validate frame dimensions against safe bounds (up to 8K resolutions)
+                if 0 < w <= 7680 and 0 < h <= 4320:
                     expected_pixel_bytes = w * h * 4
                     header_size = len(raw_data) - expected_pixel_bytes
                     if (
-                        header_size in (12, 16)
+                        header_size in (12, 16, 24)
                         and len(raw_data) >= header_size + expected_pixel_bytes
                     ):
                         pixel_bytes = raw_data[
@@ -303,26 +325,36 @@ class ADBManager:
                         return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
         except Exception:
             pass
+        finally:
+            if process and process.poll() is None:
+                process.kill()
+                process.wait()
 
+        # Fallback to PNG decoding if raw binary screencap fails or is unsupported
         cmd_png = [self.adb_path, "-s", device_serial, "exec-out", "screencap", "-p"]
+        process_png = None
         try:
-            process = subprocess.Popen(
+            process_png = subprocess.Popen(
                 cmd_png, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             try:
-                raw_png, _ = process.communicate(timeout=2.0)
+                raw_png, _ = process_png.communicate(timeout=2.0)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+                process_png.kill()
+                process_png.wait()
                 return None
 
-            if process.returncode != 0 or not raw_png:
+            if process_png.returncode != 0 or not raw_png:
                 return None
 
             frame_array = np.frombuffer(raw_png, dtype=np.uint8)
             return cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
         except Exception:
             return None
+        finally:
+            if process_png and process_png.poll() is None:
+                process_png.kill()
+                process_png.wait()
 
     def tap(self, device_serial: str, x: int, y: int) -> None:
         """Executes a single tap action at specified coordinates."""

@@ -24,25 +24,35 @@ def unregister_worker(serial: str) -> None:
         active_workers.pop(serial, None)
 
 
+def _get_workers_telemetry_snapshot() -> list:
+    """Safely extracts a snapshot of worker statuses under thread lock without blocking asyncio."""
+    data = []
+    with _workers_lock:
+        for serial, worker in list(active_workers.items()):
+            data.append(
+                {
+                    "serial": serial,
+                    "state": getattr(worker.state, "name", "UNKNOWN"),
+                    "is_running": getattr(worker, "is_running", False),
+                }
+            )
+    return data
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """Broadcasts telemetry updates without blocking the asyncio event loop."""
     await websocket.accept()
     try:
         while True:
-            data = []
-            with _workers_lock:
-                for serial, worker in list(active_workers.items()):
-                    data.append(
-                        {
-                            "serial": serial,
-                            "state": getattr(worker.state, "name", "UNKNOWN"),
-                            "is_running": getattr(worker, "is_running", False),
-                        }
-                    )
+            # Delegate thread-bound state collection to a thread worker to keep asyncio non-blocking
+            data = await asyncio.to_thread(_get_workers_telemetry_snapshot)
             await websocket.send_json({"type": "STATE_UPDATE", "instances": data})
             await asyncio.sleep(0.5)
-    except (WebSocketDisconnect, Exception):
+    except WebSocketDisconnect:
         pass
+    except Exception as err:
+        print(f"[WebSocket] Telemetry connection closed: {err}")
 
 
 def start_gui():

@@ -335,56 +335,107 @@ class VisionEngine:
         self,
         frame: np.ndarray,
         roi: Optional[Tuple[int, int, int, int]] = None,
-    ) -> bool:
-        """Strict visual recognition for top-right cutscene skip button using structural feature analysis."""
+    ) -> Optional[Tuple[int, int]]:
+        """Detects top-right cutscene skip button using dual-pass OCR and icon color heuristics.
+        Returns (x, y) tap coordinates if detected, otherwise None."""
         if frame is None or frame.size == 0:
-            return False
+            return None
 
+        fh, fw = frame.shape[:2]
         target_img = frame
+        offset_x, offset_y = 0, 0
+
         if roi:
             x, y, w, h = roi
-            fh, fw = frame.shape[:2]
             if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > fw or y + h > fh:
-                return False
+                return None
             target_img = frame[y : y + h, x : x + w]
+            offset_x, offset_y = x, y
 
-        gray = cv2.cvtColor(target_img, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(target_img, cv2.COLOR_BGR2HSV)
+        # Pass 1: Direct Grayscale Thresholding for Small Thai Text ("แตะเพื่อข้าม", "ข้าม")
+        gray = cv2.cvtColor(target_img, cv2.COLOR_BGR2GRAY) if target_img.ndim == 3 else target_img
+        _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        
+        # Bypassing heavy CLAHE to preserve thin Thai diacritics
+        try:
+            with self._ocr_lock:
+                results = self.reader.readtext(thresh, paragraph=False, detail=1)
+                for bbox, text, prob in results:
+                    clean_text = str(text).casefold().replace(" ", "")
+                    if any(kw in clean_text for kw in ["ข้าม", "แตะเพื่อ", "skip", "pass"]):
+                        points = np.asarray(bbox, dtype=np.float32)
+                        cx = int(round(float(points[:, 0].mean()))) + offset_x
+                        cy = int(round(float(points[:, 1].mean()))) + offset_y
+                        return (cx, cy)
+        except Exception:
+            pass
 
-        lower_green = np.array([35, 140, 140])
-        upper_green = np.array([85, 255, 255])
-        green_mask = cv2.inRange(hsv, lower_green, upper_green)
+        # Pass 2: Neon-Green Fast-Forward Chevron Icon Detection (⏩)
+        if target_img.ndim == 3:
+            hsv = cv2.cvtColor(target_img, cv2.COLOR_BGR2HSV)
+            # Expanded HSV range to capture neon green/cyan chevron icons
+            lower_green = np.array([30, 60, 90])
+            upper_green = np.array([100, 255, 255])
+            green_mask = cv2.inRange(hsv, lower_green, upper_green)
 
-        contours, _ = cv2.findContours(
-            green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+            contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                area = cv2.contourArea(c)
+                if 10 <= area <= 1000:
+                    bx, by, bw, bh = cv2.boundingRect(c)
+                    if 0.5 <= (float(bw) / float(bh)) <= 2.0:
+                        center_x = offset_x + bx + (bw // 2)
+                        center_y = offset_y + by + (bh // 2)
+                        return (center_x, center_y)
 
-        for c in contours:
-            area = cv2.contourArea(c)
-            if 60 <= area <= 1500:
-                bx, by, bw, bh = cv2.boundingRect(c)
-                aspect_ratio = float(bw) / float(bh)
-                if 0.7 <= aspect_ratio <= 1.4:
-                    green_crop_gray = gray[by : by + bh, bx : bx + bw]
-                    if green_crop_gray.size > 0:
-                        _, white_mask = cv2.threshold(
-                            green_crop_gray, 200, 255, cv2.THRESH_BINARY
-                        )
-                        white_pixels = cv2.countNonZero(white_mask)
-                        white_ratio = white_pixels / float(bw * bh)
+        return None
 
-                        if 0.12 <= white_ratio <= 0.55:
-                            return True
+    def detect_dialogue_or_cutscene(
+        self,
+        frame: np.ndarray,
+    ) -> Optional[Tuple[int, int]]:
+        """Secondary fail-safe: Detects active dialogue choices or NPC text banners when skip button is absent.
+        Returns tap coordinates for the dialogue prompt or screen center."""
+        if frame is None or frame.size == 0:
+            return None
 
-        return False
+        fh, fw = frame.shape[:2]
+        
+        # Lower half region where NPC names, dialogues, and choices ('💬') appear
+        dialogue_roi = (0, int(fh * 0.55), fw, int(fh * 0.40))
+        x, y, w, h = dialogue_roi
+        crop = frame[y : y + h, x : x + w]
+
+        # Search for interactive dialogue options (marked with speech bubble icon '💬' or text questions)
+        ocr_texts = self.read_thai_text(crop)
+        if ocr_texts:
+            anchor = self.find_text_anchor(crop, keywords=["?", "💬", "คือ", "อะไร", "ไป", "ตื่น"])
+            if anchor:
+                (local_x, local_y), _ = anchor
+                return (local_x + x, local_y + y)
+
+            # Fallback: Tap right-hand side dialogue selection area
+            return (int(fw * 0.75), int(fh * 0.75))
+
+        return None
 
     def preprocess_for_ocr(self, img: np.ndarray) -> np.ndarray:
-        """Upscales crop 2.5x and applies CLAHE enhancement without ruining Thai glyphs."""
+        """Adaptively rescales ROI crops and applies CLAHE enhancement for optimal EasyOCR text recognition."""
+        if img is None or img.size == 0:
+            return img
+
         h, w = img.shape[:2]
-        upscaled = cv2.resize(
-            img, (int(w * 2.5), int(h * 2.5)), interpolation=cv2.INTER_CUBIC
-        )
-        gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+        
+        # Target an optimal character height range (~150px height) to prevent matrix bloat
+        target_h = 150.0
+        if h < target_h:
+            scale = min(target_h / float(h), 2.5)  # Cap maximum upscale factor at 2.5x
+            new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+            img_scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        else:
+            img_scaled = img
+
+        gray = cv2.cvtColor(img_scaled, cv2.COLOR_BGR2GRAY) if img_scaled.ndim == 3 else img_scaled
         clahe = cv2.createCLAHE(
             clipLimit=self.config.clahe_clip_limit,
             tileGridSize=self.config.clahe_grid_size,

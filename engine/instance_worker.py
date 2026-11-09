@@ -380,7 +380,7 @@ class InstanceWorker:
             )
 
     def _process_state(self, frame: np.ndarray) -> None:
-        """Executes dynamic text anchor discovery and state progression without hardcoded pixel reliance."""
+        """Executes state machine pipeline with multi-layered cutscene and dialogue handling."""
         current_time = time.time()
         fh, fw = frame.shape[:2]
 
@@ -394,7 +394,7 @@ class InstanceWorker:
             is_one_shot = self._one_shot_target
             current_state = self._state
 
-        # Diagnostic Heartbeat Telemetry (Every 3 Seconds)
+        # Diagnostic Telemetry Heartbeat (Every 3 Seconds)
         if (current_time - self._last_heartbeat_time) > 3.0:
             self._last_heartbeat_time = current_time
             signals.log_emitted.emit(
@@ -408,13 +408,16 @@ class InstanceWorker:
         hud_abs_roi = get_abs_roi(self.config.quest_hud_rel_roi, fw, fh)
         go_gui_abs_roi = get_abs_roi(self.config.quest_gui_go_rel_roi, fw, fh)
 
-        # Step 1: Preemptive Structural Cutscene Detection
-        if self.vision.detect_cutscene_skip_button(frame, roi=cutscene_abs_roi):
-            skip_x, skip_y = get_abs_point(self.config.skip_button_rel_point, fw, fh)
+        # Step 1: Primary Cutscene Skip Button Detection (Top-Right UI)
+        cutscene_pos = self.vision.detect_cutscene_skip_button(
+            frame, roi=cutscene_abs_roi
+        )
+        if cutscene_pos:
+            skip_x, skip_y = cutscene_pos
             signals.log_emitted.emit(
                 "INFO",
                 "ACTION",
-                f"🎬 Cutscene Skip Button verified via structural recognition! Tapping at [{skip_x}, {skip_y}].",
+                f"🎬 Cutscene Skip Button detected at [{skip_x}, {skip_y}]! Tapping to skip.",
                 self.device_serial,
             )
             self.register_tap(skip_x, skip_y, label="SKIP CUTSCENE")
@@ -424,10 +427,30 @@ class InstanceWorker:
                 current_state = self._state
 
             signals.state_changed.emit(self.device_serial, current_state.name)
-            time.sleep(0.8)
+            self._stop_event.wait(0.8)
             return
 
-        # Step 2: Dynamic User Crop Target Match (Scale-Invariant)
+        # Step 2: Secondary Fail-Safe Cutscene & Dialogue Screen Detection
+        dialogue_pos = self.vision.detect_dialogue_or_cutscene(frame)
+        if dialogue_pos:
+            diag_x, diag_y = dialogue_pos
+            signals.log_emitted.emit(
+                "INFO",
+                "ACTION",
+                f"💬 Active Cutscene / Dialogue detected at [{diag_x}, {diag_y}]. Tapping to advance.",
+                self.device_serial,
+            )
+            self.register_tap(diag_x, diag_y, label="ADVANCE DIALOGUE")
+
+            with self._lock:
+                self._state = BotState.HANDLE_DIALOG
+                current_state = self._state
+
+            signals.state_changed.emit(self.device_serial, current_state.name)
+            self._stop_event.wait(0.6)
+            return
+
+        # Step 3: Dynamic User Crop Target Match (Scale-Invariant)
         if (
             target_tmpl is not None
             and target_tmpl.size > 0
@@ -454,20 +477,21 @@ class InstanceWorker:
                 with self._lock:
                     if is_one_shot:
                         self._active_target_template = None
+                        self._active_target_roi = None
                     self._state = BotState.CHECK_QUEST
                     current_state = self._state
 
                 signals.state_changed.emit(self.device_serial, current_state.name)
-                time.sleep(0.3)
+                self._stop_event.wait(0.3)
+                return
 
-        # Step 3: Fully Dynamic Quest GUI Automation
+        # Step 4: Standard Quest HUD & GUI Automation
         match current_state:
-            case BotState.INIT | BotState.SKIP_CUTSCENE:
+            case BotState.INIT | BotState.SKIP_CUTSCENE | BotState.HANDLE_DIALOG:
                 self.state = BotState.CHECK_QUEST
                 signals.state_changed.emit(self.device_serial, self.state.name)
 
             case BotState.CHECK_QUEST:
-                # Dynamic OCR Text Anchor Search across Left HUD
                 quest_keywords = [
                     "การเดินทาง",
                     "งานฉลอง",
@@ -487,13 +511,13 @@ class InstanceWorker:
                     signals.log_emitted.emit(
                         "INFO",
                         "VISION",
-                        f"✨ Dynamic OCR Text Anchor matched '{matched_text}' at [{tap_x}, {tap_y}]. Opening Quest GUI.",
+                        f"✨ Dynamic Quest Anchor matched '{matched_text}' at [{tap_x}, {tap_y}]. Opening Quest GUI.",
                         self.device_serial,
                     )
                     self.register_tap(tap_x, tap_y, label=f"QUEST: {matched_text[:10]}")
                     self.state = BotState.OPEN_QUEST_GUI
                     signals.state_changed.emit(self.device_serial, self.state.name)
-                    time.sleep(0.8)
+                    self._stop_event.wait(0.8)
                 else:
                     signals.log_emitted.emit(
                         "WARN",
@@ -503,7 +527,6 @@ class InstanceWorker:
                     )
 
             case BotState.OPEN_QUEST_GUI | BotState.SELECT_MAIN_QUEST:
-                # Select top main quest item in GUI menu
                 top_x, top_y = get_abs_point(
                     self.config.top_main_quest_rel_point, fw, fh
                 )
@@ -516,10 +539,9 @@ class InstanceWorker:
                 self.register_tap(top_x, top_y, label="SELECT MAIN QUEST")
                 self.state = BotState.CLICK_GO_BUTTON
                 signals.state_changed.emit(self.device_serial, self.state.name)
-                time.sleep(0.4)
+                self._stop_event.wait(0.4)
 
             case BotState.CLICK_GO_BUTTON:
-                # Dynamic OCR search for yellow "ไป" button in bottom-right GUI region
                 go_anchor = self.vision.find_text_anchor(
                     frame, keywords=["ไป", "Go"], roi=go_gui_abs_roi
                 )
@@ -529,7 +551,7 @@ class InstanceWorker:
                     signals.log_emitted.emit(
                         "INFO",
                         "VISION",
-                        f"🟡 Dynamic 'ไป' Go button text anchor verified at [{go_x}, {go_y}]. Executing tap.",
+                        f"🟡 Dynamic 'ไป' Go button verified at [{go_x}, {go_y}]. Executing tap.",
                         self.device_serial,
                     )
                 else:
@@ -544,13 +566,9 @@ class InstanceWorker:
                 self.register_tap(go_x, go_y, label="GO MAIN QUEST")
                 self.state = BotState.WAIT_QUEST_PROGRESS
                 signals.state_changed.emit(self.device_serial, self.state.name)
-                time.sleep(1.0)
+                self._stop_event.wait(1.0)
 
             case BotState.WAIT_QUEST_PROGRESS:
-                self.state = BotState.CHECK_QUEST
-                signals.state_changed.emit(self.device_serial, self.state.name)
-
-            case BotState.HANDLE_DIALOG:
                 self.state = BotState.CHECK_QUEST
                 signals.state_changed.emit(self.device_serial, self.state.name)
 

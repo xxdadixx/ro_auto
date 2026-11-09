@@ -1,7 +1,8 @@
 import concurrent.futures
-import sys
-import time
 import html
+import sys
+import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -440,7 +441,7 @@ class InstanceCardWidget(QFrame):
         layout.addWidget(self.btn_toggle)
 
     def _on_canvas_clicked(self, event) -> None:
-        """Handles direct mouse clicks on preview cards to execute test taps and display visual overlays."""
+        """Handles direct mouse clicks on preview cards to execute test taps asynchronously without blocking the UI thread."""
         if event.button() != Qt.LeftButton or not self._last_raw_frame_size:
             return
 
@@ -469,7 +470,19 @@ class InstanceCardWidget(QFrame):
             window = self.window()
             if hasattr(window, "workers") and self.serial in window.workers:
                 worker = window.workers[self.serial]
-                worker.register_tap(real_x, real_y, label="MANUAL TEST TAP")
+                
+                # Offload ADB execution to background executor thread to keep GUI responsive
+                if hasattr(window, "executor"):
+                    window.executor.submit(
+                        worker.register_tap, real_x, real_y, "MANUAL TEST TAP"
+                    )
+                else:
+                    threading.Thread(
+                        target=worker.register_tap,
+                        args=(real_x, real_y, "MANUAL TEST TAP"),
+                        daemon=True,
+                    ).start()
+
                 signals.log_emitted.emit(
                     "INFO",
                     "ACTION",
@@ -1075,7 +1088,7 @@ class MainWindow(QMainWindow):
         message: str,
         serial: str,
     ) -> None:
-        """Append escaped log content to prevent HTML markup injection."""
+        """Append escaped log content with document block count capping to prevent memory leaks."""
         if self._is_shutting_down:
             return
 
@@ -1109,6 +1122,11 @@ class MainWindow(QMainWindow):
             f"[{safe_tag}] ({safe_serial}): "
             f"{safe_message}</span>"
         )
+
+        # Enforce maximum block count in document DOM to maintain smooth performance
+        doc = self.terminal_log.document()
+        if doc.maximumBlockCount() != 500:
+            doc.setMaximumBlockCount(500)
 
         self.terminal_log.append(formatted)
 
